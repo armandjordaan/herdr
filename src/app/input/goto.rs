@@ -115,22 +115,20 @@ pub(crate) fn rebuild_items(state: &AppState) -> Vec<GotoItem> {
             });
 
             for pane_id in tab.layout.pane_ids() {
-                let agent_label = tab
-                    .panes
-                    .get(&pane_id)
-                    .map(|pane| pane.attached_terminal_id.clone())
-                    .and_then(|tid| {
-                        state.terminals.get(&tid).map(|terminal| {
-                            terminal
-                                .manual_label
-                                .clone()
-                                .or_else(|| terminal.agent_name.clone())
-                                .or_else(|| {
-                                    terminal.effective_agent_label().map(str::to_string)
-                                })
-                                .unwrap_or_else(|| format!("pane {}", pane_id.raw()))
-                        })
-                    })
+                let Some(pane) = tab.panes.get(&pane_id) else {
+                    continue;
+                };
+                let Some(terminal) = state.terminals.get(&pane.attached_terminal_id) else {
+                    continue;
+                };
+                if !terminal.is_agent_terminal() {
+                    continue;
+                }
+                let agent_label = terminal
+                    .agent_name
+                    .clone()
+                    .or_else(|| terminal.manual_label.clone())
+                    .or_else(|| terminal.effective_agent_label().map(str::to_string))
                     .unwrap_or_else(|| format!("pane {}", pane_id.raw()));
 
                 let agent_label_view = format!(
@@ -221,7 +219,7 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_emits_space_tab_and_agent_rows() {
+    fn rebuild_skips_non_agent_panes() {
         let state = state_with_two_workspaces();
         let items = rebuild_items(&state);
         let spaces = items
@@ -238,7 +236,34 @@ mod tests {
             .count();
         assert_eq!(spaces, 2);
         assert!(tabs >= 2);
-        assert!(agents >= 2);
+        assert_eq!(agents, 0, "plain shell panes must not appear as agents");
+    }
+
+    #[test]
+    fn rebuild_emits_agent_row_when_terminal_is_agent() {
+        let mut state = state_with_two_workspaces();
+        // Tag the pane in the second workspace as an agent terminal.
+        let ws = &state.workspaces[1];
+        let pane_id = ws.tabs[0].root_pane;
+        let terminal_id = ws.tabs[0]
+            .panes
+            .get(&pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .set_agent_name("claude".into());
+
+        let items = rebuild_items(&state);
+        let agent_rows: Vec<_> = items
+            .iter()
+            .filter(|i| matches!(i.target, GotoTarget::Agent { .. }))
+            .collect();
+        assert_eq!(agent_rows.len(), 1);
+        assert!(agent_rows[0].label.contains("claude"));
     }
 
     #[test]
