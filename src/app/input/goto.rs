@@ -95,7 +95,7 @@ pub(crate) fn rebuild_items(state: &AppState) -> Vec<GotoItem> {
         .and_then(|ws| ws.focused_pane_id());
 
     for (ws_idx, ws) in state.workspaces.iter().enumerate() {
-        let ws_name = ws.display_name();
+        let ws_name = ws.display_name_from(&state.terminals, &state.terminal_runtimes);
         items.push(GotoItem {
             target: GotoTarget::Space { ws_idx },
             label: format!("[space] {ws_name}"),
