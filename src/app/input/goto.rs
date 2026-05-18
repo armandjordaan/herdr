@@ -124,13 +124,27 @@ pub(crate) fn rebuild_items(state: &AppState) -> Vec<GotoItem> {
                 // Match the sidebar's Agents panel: only panes where the
                 // terminal has an effective_agent_label (auto-detected agent
                 // or hook authority). agent_name only overrides the display.
-                if terminal.effective_agent_label().is_none() {
+                let effective = terminal.effective_agent_label();
+                tracing::debug!(
+                    target: "herdr::goto",
+                    ws = %ws_name,
+                    tab = %tab_name,
+                    pane = pane_id.raw(),
+                    terminal_id = %pane.attached_terminal_id,
+                    effective_agent_label = ?effective,
+                    agent_name = ?terminal.agent_name,
+                    manual_label = ?terminal.manual_label,
+                    detected_agent = ?terminal.detected_agent,
+                    hook_authority = ?terminal.hook_authority.as_ref().map(|h| &h.agent_label),
+                    "goto pane inspection"
+                );
+                if effective.is_none() {
                     continue;
                 }
                 let agent_label = terminal
                     .agent_name
                     .clone()
-                    .or_else(|| terminal.effective_agent_label().map(str::to_string))
+                    .or_else(|| effective.map(str::to_string))
                     .unwrap_or_default();
 
                 let agent_label_view = format!(
