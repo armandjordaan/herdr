@@ -121,13 +121,17 @@ pub(crate) fn rebuild_items(state: &AppState) -> Vec<GotoItem> {
                 let Some(terminal) = state.terminals.get(&pane.attached_terminal_id) else {
                     continue;
                 };
-                let Some(agent_label) = terminal
+                // Match the sidebar's Agents panel: only panes where the
+                // terminal has an effective_agent_label (auto-detected agent
+                // or hook authority). agent_name only overrides the display.
+                if terminal.effective_agent_label().is_none() {
+                    continue;
+                }
+                let agent_label = terminal
                     .agent_name
                     .clone()
                     .or_else(|| terminal.effective_agent_label().map(str::to_string))
-                else {
-                    continue;
-                };
+                    .unwrap_or_default();
 
                 let agent_label_view = format!(
                     "[agent] {ws_name} \u{203a} {tab_name} \u{203a} {agent_label}"
@@ -238,9 +242,39 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_emits_agent_row_when_terminal_is_agent() {
+    fn rebuild_emits_agent_row_when_terminal_has_detected_agent() {
+        use crate::detect::{Agent, AgentState};
+
         let mut state = state_with_two_workspaces();
-        // Tag the pane in the second workspace as an agent terminal.
+        // Simulate the detector having identified claude in the second workspace.
+        let ws = &state.workspaces[1];
+        let pane_id = ws.tabs[0].root_pane;
+        let terminal_id = ws.tabs[0]
+            .panes
+            .get(&pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        let terminal = state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
+        terminal.set_agent_name("my-claude".into());
+
+        let items = rebuild_items(&state);
+        let agent_rows: Vec<_> = items
+            .iter()
+            .filter(|i| matches!(i.target, GotoTarget::Agent { .. }))
+            .collect();
+        assert_eq!(agent_rows.len(), 1);
+        // agent_name overrides the displayed label.
+        assert!(agent_rows[0].label.contains("my-claude"));
+    }
+
+    #[test]
+    fn rebuild_skips_pane_with_agent_name_but_no_detected_agent() {
+        // A bare agent_name (no auto-detection, no hook authority) is not
+        // enough — matches the sidebar's filter so the picker stays
+        // consistent with what the user sees in the Agents panel.
+        let mut state = state_with_two_workspaces();
         let ws = &state.workspaces[1];
         let pane_id = ws.tabs[0].root_pane;
         let terminal_id = ws.tabs[0]
@@ -253,15 +287,14 @@ mod tests {
             .terminals
             .get_mut(&terminal_id)
             .unwrap()
-            .set_agent_name("claude".into());
+            .set_agent_name("orphan".into());
 
         let items = rebuild_items(&state);
-        let agent_rows: Vec<_> = items
+        let agents = items
             .iter()
             .filter(|i| matches!(i.target, GotoTarget::Agent { .. }))
-            .collect();
-        assert_eq!(agent_rows.len(), 1);
-        assert!(agent_rows[0].label.contains("claude"));
+            .count();
+        assert_eq!(agents, 0);
     }
 
     #[test]
