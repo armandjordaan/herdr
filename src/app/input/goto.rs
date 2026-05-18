@@ -121,15 +121,13 @@ pub(crate) fn rebuild_items(state: &AppState) -> Vec<GotoItem> {
                 let Some(terminal) = state.terminals.get(&pane.attached_terminal_id) else {
                     continue;
                 };
-                if !terminal.is_agent_terminal() {
-                    continue;
-                }
-                let agent_label = terminal
+                let Some(agent_label) = terminal
                     .agent_name
                     .clone()
-                    .or_else(|| terminal.manual_label.clone())
                     .or_else(|| terminal.effective_agent_label().map(str::to_string))
-                    .unwrap_or_else(|| format!("pane {}", pane_id.raw()));
+                else {
+                    continue;
+                };
 
                 let agent_label_view = format!(
                     "[agent] {ws_name} \u{203a} {tab_name} \u{203a} {agent_label}"
