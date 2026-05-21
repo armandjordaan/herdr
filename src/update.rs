@@ -12,10 +12,10 @@ use std::fs;
 use std::io::{self, BufRead, BufReader, IsTerminal, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, Serialize};
 
 const UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
 const HOMEBREW_FORMULA_API_URL: &str = "https://formulae.brew.sh/api/formula/herdr.json";
@@ -28,6 +28,11 @@ const DEFAULT_FAKE_UPDATE_NOTES_VERSION: &str = "0.3.0";
 const SERVER_STOP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVER_SHUTDOWN_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVER_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const STAR_PROMPT_REPO: &str = "ogulcancelik/herdr";
+const STAR_PROMPT_STATE_FILE: &str = "github-star-prompt.json";
+const STAR_PROMPT_MAX_PROMPTS: u32 = 5;
+const STAR_PROMPT_INTERVAL_UPDATES: [u32; 4] = [2, 3, 5, 7];
+const GH_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn fake_release_notes_body(version: &str) -> String {
     let notes_version = env::var(FAKE_UPDATE_NOTES_VERSION_ENV)
@@ -93,6 +98,28 @@ struct UpdateManifest {
     protocol: Option<u32>,
     notes: String,
     assets: BTreeMap<String, String>,
+    announcement: Option<serde_json::Value>,
+    #[serde(default, deserialize_with = "deserialize_manifest_releases")]
+    releases: BTreeMap<String, serde_json::Value>,
+}
+
+fn deserialize_manifest_releases<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, serde_json::Value>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(serde_json::Value::Object(object)) => object.into_iter().collect(),
+        _ => BTreeMap::new(),
+    })
+}
+
+#[derive(Deserialize)]
+struct ManifestReleaseMetadata {
+    notes: String,
+    announcement: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -110,6 +137,24 @@ impl UpdateManifest {
         self.assets.get(&format!("{os}-{arch}")).cloned()
     }
 
+    fn metadata_for_version(&self, version: &Version) -> Option<ManifestReleaseMetadata> {
+        let version = version.to_string();
+        if self.version.trim_start_matches('v') == version {
+            return Some(ManifestReleaseMetadata {
+                notes: self.notes.clone(),
+                announcement: self.announcement.clone(),
+            });
+        }
+
+        self.releases.get(&version).and_then(|release| {
+            let metadata =
+                serde_json::from_value::<ManifestReleaseMetadata>(release.clone()).ok()?;
+            (!metadata.notes_body().is_empty()).then_some(metadata)
+        })
+    }
+}
+
+impl ManifestReleaseMetadata {
     fn notes_body(&self) -> String {
         self.notes.trim().to_string()
     }
@@ -128,10 +173,7 @@ struct ReleaseInfo {
     notes_body: String,
 }
 
-/// Check the hosted update manifest for the latest release. Returns release info if newer.
-fn check_latest() -> Result<Option<ReleaseInfo>, String> {
-    let current = Version::current();
-
+fn fetch_update_manifest() -> Result<UpdateManifest, String> {
     let output = Command::new("curl")
         .args([
             "-sfL",
@@ -150,9 +192,34 @@ fn check_latest() -> Result<Option<ReleaseInfo>, String> {
         return Err("failed to fetch update manifest".into());
     }
 
-    let manifest: UpdateManifest = serde_json::from_slice(&output.stdout)
-        .map_err(|e| format!("failed to parse update manifest JSON: {e}"))?;
+    serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("failed to parse update manifest JSON: {e}"))
+}
 
+fn handle_manifest_announcement(version: &str, value: Option<&serde_json::Value>) {
+    let announcement = match value {
+        Some(value) => match serde_json::from_value::<
+            crate::product_announcements::ManifestAnnouncement,
+        >(value.clone())
+        {
+            Ok(announcement) => Some(announcement),
+            Err(err) => {
+                tracing::warn!("skipping invalid product announcement in update manifest: {err}");
+                None
+            }
+        },
+        None => None,
+    };
+
+    if let Err(err) =
+        crate::product_announcements::save_manifest_announcement(version, announcement.as_ref())
+    {
+        tracing::warn!("failed to save product announcement: {err}");
+    }
+}
+
+fn release_info_from_manifest(manifest: &UpdateManifest) -> Result<Option<ReleaseInfo>, String> {
+    let current = Version::current();
     let latest = Version::parse(&manifest.version)
         .ok_or_else(|| format!("invalid version in update manifest: {}", manifest.version))?;
 
@@ -160,7 +227,10 @@ fn check_latest() -> Result<Option<ReleaseInfo>, String> {
         return Ok(None); // up to date
     }
 
-    let notes_body = manifest.notes_body();
+    let metadata = manifest
+        .metadata_for_version(&latest)
+        .ok_or_else(|| format!("missing release metadata for v{latest}"))?;
+    let notes_body = metadata.notes_body();
     if notes_body.is_empty() {
         return Err("update manifest notes are empty".into());
     }
@@ -176,6 +246,21 @@ fn check_latest() -> Result<Option<ReleaseInfo>, String> {
         download_url,
         notes_body,
     }))
+}
+
+/// Check the hosted update manifest for the latest release. Returns release info if newer.
+fn check_latest() -> Result<Option<ReleaseInfo>, String> {
+    let manifest = fetch_update_manifest()?;
+    let release = release_info_from_manifest(&manifest)?;
+    if let Some(release) = &release {
+        if let Some(metadata) = manifest.metadata_for_version(&release.version) {
+            handle_manifest_announcement(
+                &release.version.to_string(),
+                metadata.announcement.as_ref(),
+            );
+        }
+    }
+    Ok(release)
 }
 
 fn parse_homebrew_formula_stable_version(input: &[u8]) -> Result<Version, String> {
@@ -363,8 +448,8 @@ fn update_requires_server_stop(server: &crate::api::RuntimeStatus, release: &Rel
 fn parse_stop_server_before_update_response(input: &str) -> Option<bool> {
     let trimmed = input.trim().to_ascii_lowercase();
     match trimmed.as_str() {
-        "" | "n" | "no" => Some(false),
-        "y" | "yes" => Some(true),
+        "" | "y" | "yes" => Some(true),
+        "n" | "no" => Some(false),
         _ => None,
     }
 }
@@ -412,9 +497,9 @@ fn prompt_to_stop_server_before_update(
 
     loop {
         let prompt = if requires_stop {
-            "stop the server and continue updating? [y/N] "
+            "stop the server and continue updating? [Y/n] "
         } else {
-            "stop the server before updating? [y/N] "
+            "stop the server before updating? [Y/n] "
         };
         eprint!("{prompt}");
         io::stderr()
@@ -636,6 +721,264 @@ fn homebrew_cellar_keg_root(path: &Path) -> Option<PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
+// GitHub star prompt
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct StarPromptState {
+    #[serde(default)]
+    prompts_shown: u32,
+    #[serde(default)]
+    successful_updates_since_prompt: u32,
+    #[serde(default)]
+    known_starred: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum GithubStarStatus {
+    Starred,
+    NotStarred,
+    Unknown,
+}
+
+fn star_prompt_state_path() -> PathBuf {
+    crate::config::state_dir().join(STAR_PROMPT_STATE_FILE)
+}
+
+fn load_star_prompt_state_from_path(path: &Path) -> StarPromptState {
+    let Ok(content) = fs::read_to_string(path) else {
+        return StarPromptState::default();
+    };
+    serde_json::from_str(&content).unwrap_or_default()
+}
+
+fn save_star_prompt_state_to_path(path: &Path, state: &StarPromptState) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let json = serde_json::to_string_pretty(state).map_err(io::Error::other)?;
+    let tmp_path = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    fs::write(&tmp_path, json)?;
+    if let Err(err) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn star_prompt_due(state: &StarPromptState) -> bool {
+    if state.known_starred {
+        return false;
+    }
+    if state.prompts_shown == 0 {
+        return true;
+    }
+    if state.prompts_shown >= STAR_PROMPT_MAX_PROMPTS {
+        return false;
+    }
+
+    let interval_index = state.prompts_shown.saturating_sub(1) as usize;
+    let Some(interval) = STAR_PROMPT_INTERVAL_UPDATES.get(interval_index) else {
+        return false;
+    };
+    state.successful_updates_since_prompt.saturating_add(1) >= *interval
+}
+
+fn record_successful_update_without_star_prompt(state: &mut StarPromptState) {
+    state.successful_updates_since_prompt = state.successful_updates_since_prompt.saturating_add(1);
+}
+
+fn record_star_prompt_shown(state: &mut StarPromptState) {
+    state.prompts_shown = state.prompts_shown.saturating_add(1);
+    state.successful_updates_since_prompt = 0;
+}
+
+fn command_status_succeeds_with_timeout(command: &mut Command, timeout: Duration) -> bool {
+    let Ok(mut child) = command.spawn() else {
+        return false;
+    };
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
+fn command_output_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+) -> io::Result<Option<std::process::Output>> {
+    let mut child = command.spawn()?;
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        match child.try_wait()? {
+            Some(_) => return child.wait_with_output().map(Some),
+            None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(None);
+            }
+        }
+    }
+}
+
+fn command_succeeds(command: &str, args: &[&str]) -> bool {
+    let mut command = Command::new(command);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command_status_succeeds_with_timeout(&mut command, GH_COMMAND_TIMEOUT)
+}
+
+fn gh_cli_available() -> bool {
+    command_succeeds("gh", &["--version"])
+}
+
+fn gh_auth_succeeds() -> bool {
+    command_succeeds("gh", &["auth", "status", "--hostname", "github.com"])
+}
+
+fn gh_viewer_star_status() -> GithubStarStatus {
+    let mut command = Command::new("gh");
+    command
+        .args([
+            "repo",
+            "view",
+            STAR_PROMPT_REPO,
+            "--json",
+            "viewerHasStarred",
+            "--jq",
+            ".viewerHasStarred",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+    let Ok(Some(output)) = command_output_with_timeout(&mut command, GH_COMMAND_TIMEOUT) else {
+        return GithubStarStatus::Unknown;
+    };
+    if !output.status.success() {
+        return GithubStarStatus::Unknown;
+    }
+
+    match String::from_utf8_lossy(&output.stdout).trim() {
+        "true" => GithubStarStatus::Starred,
+        "false" => GithubStarStatus::NotStarred,
+        _ => GithubStarStatus::Unknown,
+    }
+}
+
+fn parse_star_prompt_response(input: &str) -> Option<bool> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "" | "y" | "yes" => Some(true),
+        "n" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+fn prompt_to_star_repository() -> io::Result<bool> {
+    loop {
+        eprint!("If herdr has been useful, would you like to star it? [Y/n] ");
+        io::stderr().flush()?;
+
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input)? == 0 {
+            return Ok(false);
+        }
+        if let Some(answer) = parse_star_prompt_response(&input) {
+            return Ok(answer);
+        }
+        eprintln!("please answer y or n.");
+    }
+}
+
+fn star_repository_with_gh() -> bool {
+    let endpoint = format!("/user/starred/{STAR_PROMPT_REPO}");
+    let mut command = Command::new("gh");
+    command
+        .args(["api", "--method", "PUT", endpoint.as_str(), "--silent"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    if command_status_succeeds_with_timeout(&mut command, GH_COMMAND_TIMEOUT) {
+        eprintln!("starred {STAR_PROMPT_REPO}. thank you.");
+        true
+    } else {
+        false
+    }
+}
+
+fn maybe_offer_star_after_successful_update() {
+    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+        return;
+    }
+
+    let path = star_prompt_state_path();
+    let mut state = load_star_prompt_state_from_path(&path);
+    if state.known_starred {
+        return;
+    }
+    if !star_prompt_due(&state) {
+        record_successful_update_without_star_prompt(&mut state);
+        if let Err(err) = save_star_prompt_state_to_path(&path, &state) {
+            tracing::warn!(err = %err, "failed to save GitHub star prompt state");
+        }
+        return;
+    }
+
+    if !gh_cli_available() || !gh_auth_succeeds() {
+        return;
+    }
+    match gh_viewer_star_status() {
+        GithubStarStatus::NotStarred => {}
+        GithubStarStatus::Starred => {
+            state.known_starred = true;
+            if let Err(err) = save_star_prompt_state_to_path(&path, &state) {
+                tracing::warn!(err = %err, "failed to save GitHub star prompt state");
+            }
+            return;
+        }
+        GithubStarStatus::Unknown => return,
+    }
+
+    record_star_prompt_shown(&mut state);
+    if let Err(err) = save_star_prompt_state_to_path(&path, &state) {
+        tracing::warn!(err = %err, "failed to save GitHub star prompt state");
+        return;
+    }
+
+    match prompt_to_star_repository() {
+        Ok(true) => {
+            if star_repository_with_gh() {
+                state.known_starred = true;
+                if let Err(err) = save_star_prompt_state_to_path(&path, &state) {
+                    tracing::warn!(err = %err, "failed to save GitHub star prompt state");
+                }
+            }
+        }
+        Ok(false) => {}
+        Err(err) => tracing::warn!(err = %err, "failed to read GitHub star prompt response"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -685,6 +1028,8 @@ pub fn self_update() -> Result<Version, String> {
     } else {
         eprintln!("run herdr again.");
     }
+
+    maybe_offer_star_after_successful_update();
 
     Ok(release.version)
 }
@@ -791,9 +1136,13 @@ fn auto_update_homebrew(events: tokio::sync::mpsc::Sender<crate::events::AppEven
 }
 
 fn homebrew_release_notes_body(version: &Version) -> String {
-    if let Ok(Some(release)) = check_latest() {
-        if release.version == *version {
-            return release.notes_body;
+    if let Ok(manifest) = fetch_update_manifest() {
+        if let Some(metadata) = manifest.metadata_for_version(version) {
+            let notes_body = metadata.notes_body();
+            if !notes_body.is_empty() {
+                handle_manifest_announcement(&version.to_string(), metadata.announcement.as_ref());
+                return notes_body;
+            }
         }
     }
 
@@ -970,13 +1319,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_stop_server_before_update_response_defaults_no_for_blank() {
-        assert_eq!(parse_stop_server_before_update_response(""), Some(false));
-        assert_eq!(parse_stop_server_before_update_response("\n"), Some(false));
-        assert_eq!(parse_stop_server_before_update_response("n"), Some(false));
-        assert_eq!(parse_stop_server_before_update_response("no"), Some(false));
+    fn parse_stop_server_before_update_response_defaults_yes_for_blank() {
+        assert_eq!(parse_stop_server_before_update_response(""), Some(true));
+        assert_eq!(parse_stop_server_before_update_response("\n"), Some(true));
         assert_eq!(parse_stop_server_before_update_response("y"), Some(true));
         assert_eq!(parse_stop_server_before_update_response("yes"), Some(true));
+        assert_eq!(parse_stop_server_before_update_response("n"), Some(false));
+        assert_eq!(parse_stop_server_before_update_response("no"), Some(false));
         assert_eq!(parse_stop_server_before_update_response("later"), None);
     }
 
@@ -1135,6 +1484,82 @@ mod tests {
     }
 
     #[test]
+    fn star_prompt_response_defaults_yes() {
+        assert_eq!(parse_star_prompt_response(""), Some(true));
+        assert_eq!(parse_star_prompt_response("\n"), Some(true));
+        assert_eq!(parse_star_prompt_response("y"), Some(true));
+        assert_eq!(parse_star_prompt_response("yes"), Some(true));
+        assert_eq!(parse_star_prompt_response("n"), Some(false));
+        assert_eq!(parse_star_prompt_response("no"), Some(false));
+        assert_eq!(parse_star_prompt_response("later"), None);
+    }
+
+    #[test]
+    fn star_prompt_is_due_five_times_with_increasing_intervals() {
+        let mut state = StarPromptState::default();
+
+        assert!(star_prompt_due(&state));
+        record_star_prompt_shown(&mut state);
+        assert_eq!(state.prompts_shown, 1);
+        assert_eq!(state.successful_updates_since_prompt, 0);
+
+        for interval in STAR_PROMPT_INTERVAL_UPDATES {
+            for update in 1..interval {
+                assert!(
+                    !star_prompt_due(&state),
+                    "prompt was early at update {update}/{interval}"
+                );
+                record_successful_update_without_star_prompt(&mut state);
+            }
+
+            assert!(
+                star_prompt_due(&state),
+                "prompt was not due after {interval} updates"
+            );
+            record_star_prompt_shown(&mut state);
+            assert_eq!(state.successful_updates_since_prompt, 0);
+        }
+
+        assert_eq!(state.prompts_shown, STAR_PROMPT_MAX_PROMPTS);
+        for _ in 0..20 {
+            assert!(!star_prompt_due(&state));
+            record_successful_update_without_star_prompt(&mut state);
+        }
+    }
+
+    #[test]
+    fn star_prompt_is_never_due_after_known_starred() {
+        let mut state = StarPromptState {
+            prompts_shown: 1,
+            successful_updates_since_prompt: 99,
+            known_starred: true,
+        };
+
+        assert!(!star_prompt_due(&state));
+        record_successful_update_without_star_prompt(&mut state);
+        assert!(!star_prompt_due(&state));
+    }
+
+    #[test]
+    fn star_prompt_state_round_trips() {
+        let path = std::env::temp_dir().join(format!(
+            "herdr-star-prompt-{}-{}.json",
+            std::process::id(),
+            "round-trip"
+        ));
+        let state = StarPromptState {
+            prompts_shown: 2,
+            successful_updates_since_prompt: 1,
+            known_starred: false,
+        };
+
+        save_star_prompt_state_to_path(&path, &state).unwrap();
+
+        assert_eq!(load_star_prompt_state_from_path(&path), state);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn platform_target_is_known() {
         let (os, arch) = platform_target();
         assert!(os == "linux" || os == "macos", "os: {os}");
@@ -1147,6 +1572,11 @@ mod tests {
             \"version\": \"0.2.0\",\n\
             \"protocol\": 4,\n\
             \"notes\": \"### Changed\\n- One\",\n\
+            \"announcement\": {\n\
+                \"id\": \"keymap-v2\",\n\
+                \"title\": \"Keymap changes\",\n\
+                \"body\": \"### Heads up\\n- Defaults changed\"\n\
+            },\n\
             \"assets\": {\n\
                 \"linux-x86_64\": \"https://example.com/herdr-linux-x86_64\",\n\
                 \"macos-aarch64\": \"https://example.com/herdr-macos-aarch64\"\n\
@@ -1156,10 +1586,122 @@ mod tests {
         assert_eq!(manifest.version, "0.2.0");
         assert_eq!(manifest.protocol, Some(4));
         assert_eq!(manifest.assets.len(), 2);
-        assert_eq!(manifest.notes_body(), "### Changed\n- One");
+        assert_eq!(
+            manifest
+                .metadata_for_version(&Version::parse("0.2.0").unwrap())
+                .expect("metadata")
+                .notes_body(),
+            "### Changed\n- One"
+        );
+        assert_eq!(
+            manifest
+                .announcement
+                .as_ref()
+                .and_then(|announcement| announcement.get("id"))
+                .and_then(serde_json::Value::as_str),
+            Some("keymap-v2")
+        );
         assert_eq!(
             manifest.download_url_for("linux", "x86_64").as_deref(),
             Some("https://example.com/herdr-linux-x86_64")
+        );
+    }
+
+    #[test]
+    fn update_manifest_reads_archived_release_metadata() {
+        let json = r####"{
+            "version": "0.3.0",
+            "protocol": 4,
+            "notes": "### Changed\n- Three",
+            "assets": {
+                "linux_x86_64": "https://example.com/unused"
+            },
+            "releases": {
+                "0.2.0": {
+                    "notes": "### Changed\n- Two",
+                    "announcement": {
+                        "id": "two",
+                        "title": "Two",
+                        "body": "### Two"
+                    }
+                }
+            }
+        }"####;
+        let manifest: UpdateManifest = serde_json::from_str(json).unwrap();
+        let version = Version::parse("0.2.0").unwrap();
+        let metadata = manifest.metadata_for_version(&version).expect("metadata");
+
+        assert_eq!(metadata.notes_body(), "### Changed\n- Two");
+        assert_eq!(
+            metadata
+                .announcement
+                .as_ref()
+                .and_then(|announcement| announcement.get("id"))
+                .and_then(serde_json::Value::as_str),
+            Some("two")
+        );
+    }
+
+    #[test]
+    fn update_manifest_root_metadata_wins_for_latest_version() {
+        let json = r####"{
+            "version": "0.3.0",
+            "protocol": 4,
+            "notes": "### Changed\n- Root",
+            "announcement": {
+                "id": "root",
+                "title": "Root",
+                "body": "### Root"
+            },
+            "assets": {
+                "linux_x86_64": "https://example.com/unused"
+            },
+            "releases": {
+                "0.3.0": {
+                    "notes": "### Changed\n- Stale",
+                    "announcement": {
+                        "id": "stale",
+                        "title": "Stale",
+                        "body": "### Stale"
+                    }
+                }
+            }
+        }"####;
+        let manifest: UpdateManifest = serde_json::from_str(json).unwrap();
+        let version = Version::parse("0.3.0").unwrap();
+        let metadata = manifest.metadata_for_version(&version).expect("metadata");
+
+        assert_eq!(metadata.notes_body(), "### Changed\n- Root");
+        assert_eq!(
+            metadata
+                .announcement
+                .as_ref()
+                .and_then(|announcement| announcement.get("id"))
+                .and_then(serde_json::Value::as_str),
+            Some("root")
+        );
+    }
+
+    #[test]
+    fn update_manifest_ignores_malformed_releases_container() {
+        let json = r####"{
+            "version": "0.3.0",
+            "protocol": 4,
+            "notes": "### Changed\n- Root",
+            "assets": {
+                "linux_x86_64": "https://example.com/unused"
+            },
+            "releases": []
+        }"####;
+        let manifest: UpdateManifest = serde_json::from_str(json).unwrap();
+
+        assert!(manifest.releases.is_empty());
+        assert_eq!(
+            manifest
+                .metadata_for_version(&Version::parse("0.3.0").unwrap())
+                .expect("metadata")
+                .notes_body(),
+            "### Changed\n- Root"
         );
     }
 
@@ -1176,16 +1718,51 @@ mod tests {
     }
 
     #[test]
+    fn invalid_manifest_announcement_does_not_block_release_info() {
+        let (os, arch) = platform_target();
+        let asset_key = format!("{os}-{arch}");
+        let json = format!(
+            r####"{{
+                "version": "99.99.99",
+                "protocol": 4,
+                "notes": "### Changed\n- One",
+                "announcement": {{
+                    "id": 123,
+                    "title": "Keymap changes",
+                    "body": "### Heads up\n- Defaults changed"
+                }},
+                "assets": {{
+                    "{asset_key}": "https://example.com/herdr"
+                }}
+            }}"####
+        );
+
+        let manifest: UpdateManifest = serde_json::from_str(&json).unwrap();
+        handle_manifest_announcement(&manifest.version, manifest.announcement.as_ref());
+        let release = release_info_from_manifest(&manifest)
+            .unwrap()
+            .expect("release info");
+
+        assert_eq!(release.version, Version::parse("99.99.99").unwrap());
+        assert_eq!(release.download_url, "https://example.com/herdr");
+    }
+
+    #[test]
     fn checked_in_website_manifest_matches_update_schema() {
         let manifest: UpdateManifest = serde_json::from_str(include_str!("../website/latest.json"))
             .expect("website/latest.json should match updater schema");
 
-        assert!(!manifest.notes_body().is_empty());
+        assert!(!manifest
+            .metadata_for_version(&Version::parse(&manifest.version).unwrap())
+            .expect("metadata")
+            .notes_body()
+            .is_empty());
         // website/latest.json describes the latest released binaries, not the
         // current unreleased checkout. Its protocol is updated by the release
         // flow together with the release assets.
         assert!(manifest.protocol.is_some());
         assert_eq!(manifest.assets.len(), 4);
+        assert!(manifest.releases.contains_key(&manifest.version));
 
         for target in [
             "linux-x86_64",

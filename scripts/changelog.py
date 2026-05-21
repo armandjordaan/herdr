@@ -17,6 +17,7 @@ SECTION_RE = re.compile(r"^##\s+(?:\[(?P<bracketed>[^\]]+)\]|(?P<plain>.+?))\s*$
 VERSION_WITH_DATE_RE = re.compile(r"^(?P<version>.+?)\s+-\s+\d{4}-\d{2}-\d{2}$")
 DEFAULT_RELEASE_REPO = "ogulcancelik/herdr"
 DEFAULT_LATEST_JSON_PATH = Path("website/latest.json")
+DEFAULT_PRODUCT_ANNOUNCEMENT_PATH = Path("docs/next/product-announcement.json")
 PROTOCOL_SOURCE_PATH = Path("src/server/protocol.rs")
 ASSET_TARGETS = (
     "linux-x86_64",
@@ -133,8 +134,81 @@ def read_protocol_version(source_path: Path = PROTOCOL_SOURCE_PATH) -> int:
     return int(match.group(1))
 
 
+def normalize_announcement(value: Any, label: str) -> dict[str, str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ChangelogError(f"{label} announcement must be an object")
+
+    allowed_keys = {"id", "title", "body"}
+    extra_keys = sorted(set(value) - allowed_keys)
+    if extra_keys:
+        raise ChangelogError(
+            f"{label} announcement has unsupported field(s): {', '.join(extra_keys)}"
+        )
+
+    announcement: dict[str, str] = {}
+    for key in ("id", "title", "body"):
+        field_value = value.get(key)
+        if not isinstance(field_value, str) or not field_value.strip():
+            raise ChangelogError(f"{label} announcement is missing non-empty string field: {key}")
+        announcement[key] = field_value.strip()
+
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", announcement["id"]):
+        raise ChangelogError(
+            f"{label} announcement has invalid id; use lowercase letters, numbers, dots, underscores, or dashes"
+        )
+
+    return announcement
+
+
+def normalize_release_metadata(value: Any, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ChangelogError(f"{label} must be an object")
+
+    allowed_keys = {"notes", "announcement"}
+    extra_keys = sorted(set(value) - allowed_keys)
+    if extra_keys:
+        raise ChangelogError(f"{label} has unsupported field(s): {', '.join(extra_keys)}")
+
+    notes = value.get("notes")
+    if not isinstance(notes, str) or not notes.strip():
+        raise ChangelogError(f"{label} is missing non-empty release notes")
+
+    metadata: dict[str, Any] = {"notes": notes.strip()}
+    announcement = normalize_announcement(value.get("announcement"), label)
+    if announcement is not None:
+        metadata["announcement"] = announcement
+    return metadata
+
+
+def normalize_releases(value: Any) -> dict[str, dict[str, Any]]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ChangelogError("releases must be an object")
+
+    releases: dict[str, dict[str, Any]] = {}
+    for raw_version, raw_metadata in value.items():
+        if not isinstance(raw_version, str) or not raw_version.strip():
+            raise ChangelogError("releases contains an empty version key")
+        version = normalize_version(raw_version)
+        parse_version(version)
+        releases[version] = normalize_release_metadata(raw_metadata, f"releases.{version}")
+
+    return {
+        version: releases[version]
+        for version in sorted(releases, key=parse_version, reverse=True)
+    }
+
+
 def build_latest_json(
-    version: str, notes: str, assets: dict[str, str], protocol: int | None = None
+    version: str,
+    notes: str,
+    assets: dict[str, str],
+    protocol: int | None = None,
+    announcement: dict[str, str] | None = None,
+    releases: dict[str, Any] | None = None,
 ) -> str:
     normalized_version = normalize_version(version)
     normalized_notes = notes.strip()
@@ -149,16 +223,28 @@ def build_latest_json(
         raise ChangelogError(f"missing asset targets: {', '.join(missing_targets)}")
 
     ordered_assets = {target: assets[target] for target in ASSET_TARGETS}
+    normalized_announcement = normalize_announcement(announcement, "root")
+    archived_releases = normalize_releases(releases)
+    current_metadata: dict[str, Any] = {"notes": normalized_notes}
+    if normalized_announcement is not None:
+        current_metadata["announcement"] = normalized_announcement
+    archived_releases[normalized_version] = current_metadata
+    archived_releases = {
+        release_version: archived_releases[release_version]
+        for release_version in sorted(archived_releases, key=parse_version, reverse=True)
+    }
 
-    return json.dumps(
-        {
-            "version": normalized_version,
-            "protocol": protocol,
-            "notes": normalized_notes,
-            "assets": ordered_assets,
-        },
-        indent=2,
-    ) + "\n"
+    manifest: dict[str, Any] = {
+        "version": normalized_version,
+        "protocol": protocol,
+        "notes": normalized_notes,
+        "assets": ordered_assets,
+    }
+    if normalized_announcement is not None:
+        manifest["announcement"] = normalized_announcement
+    manifest["releases"] = archived_releases
+
+    return json.dumps(manifest, indent=2) + "\n"
 
 
 def default_release_assets(version: str, repo: str = DEFAULT_RELEASE_REPO) -> dict[str, str]:
@@ -170,7 +256,9 @@ def default_release_assets(version: str, repo: str = DEFAULT_RELEASE_REPO) -> di
     }
 
 
-def manifest_from_release_payload(payload: dict[str, Any], version: str) -> dict[str, Any]:
+def manifest_from_release_payload(
+    payload: dict[str, Any], version: str, protocol: int | None = None
+) -> dict[str, Any]:
     normalized_version = normalize_version(version)
     tag_name = str(payload.get("tagName") or "")
     if normalize_version(tag_name) != normalized_version:
@@ -209,7 +297,7 @@ def manifest_from_release_payload(payload: dict[str, Any], version: str) -> dict
 
     return {
         "version": normalized_version,
-        "protocol": read_protocol_version(),
+        "protocol": protocol if protocol is not None else read_protocol_version(),
         "notes": notes,
         "assets": manifest_assets,
     }
@@ -282,6 +370,39 @@ def load_json(path: Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ChangelogError(f"expected JSON object in {path}")
     return data
+
+
+def archived_releases_from_current_manifest(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    releases = normalize_releases(manifest.get("releases"))
+    version = manifest.get("version")
+    notes = manifest.get("notes")
+    if isinstance(version, str) and version.strip() and isinstance(notes, str) and notes.strip():
+        metadata: dict[str, Any] = {"notes": notes.strip()}
+        announcement = normalize_announcement(manifest.get("announcement"), "current root")
+        if announcement is not None:
+            metadata["announcement"] = announcement
+        releases[normalize_version(version)] = metadata
+
+    return {
+        release_version: releases[release_version]
+        for release_version in sorted(releases, key=parse_version, reverse=True)
+    }
+
+
+def load_product_announcement(path: Path) -> dict[str, str] | None:
+    try:
+        content = path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise ChangelogError(f"product announcement file not found: {path}") from exc
+
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise ChangelogError(f"invalid JSON in {path}: {exc}") from exc
+
+    if data is None:
+        return None
+    return normalize_announcement(data, f"announcement in {path}")
 
 
 def write_text(path: Path, text: str) -> None:
@@ -411,11 +532,25 @@ def cmd_sync_latest_json(args: argparse.Namespace) -> int:
     ensure_manifest_is_outdated(current_manifest, version)
 
     release_payload = fetch_release_payload(version, args.repo)
-    new_manifest = manifest_from_release_payload(release_payload, version)
-    output = build_latest_json(version, str(new_manifest["notes"]), dict(new_manifest["assets"]))
+    new_manifest = manifest_from_release_payload(release_payload, version, args.protocol)
+    announcement_path = Path(args.announcement)
+    announcement = load_product_announcement(announcement_path)
+    output = build_latest_json(
+        version,
+        str(new_manifest["notes"]),
+        dict(new_manifest["assets"]),
+        protocol=int(new_manifest["protocol"]),
+        announcement=announcement,
+        releases=archived_releases_from_current_manifest(current_manifest),
+    )
     write_text(manifest_path, output)
+    if announcement is not None:
+        write_text(announcement_path, "null\n")
 
     print(f"updated {manifest_path} from GitHub release v{version}")
+    if announcement is not None:
+        print(f"included product announcement from {announcement_path}")
+        print(f"cleared {announcement_path}")
     status_lines = git_status_lines(manifest_path)
     print("files changed:")
     if status_lines:
@@ -432,10 +567,21 @@ def cmd_sync_latest_json(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_validate_product_announcement(args: argparse.Namespace) -> int:
+    announcement = load_product_announcement(Path(args.path))
+    if announcement is None:
+        print(f"product announcement ({args.path}): none")
+    else:
+        print(
+            f"product announcement ({args.path}): {announcement['id']} - {announcement['title']}"
+        )
+    return 0
+
+
 def cmd_verify_release_state(args: argparse.Namespace) -> int:
     version = normalize_version(args.version)
     release_payload = fetch_release_payload(version, args.repo)
-    expected_manifest = manifest_from_release_payload(release_payload, version)
+    expected_manifest = manifest_from_release_payload(release_payload, version, args.protocol)
 
     local_manifest = ensure_manifest_matches_expected(
         load_json(Path(args.output)),
@@ -484,7 +630,18 @@ def build_parser() -> argparse.ArgumentParser:
     sync_latest_json.add_argument("--version", required=True)
     sync_latest_json.add_argument("--repo", default=DEFAULT_RELEASE_REPO)
     sync_latest_json.add_argument("--output", default=str(DEFAULT_LATEST_JSON_PATH))
+    sync_latest_json.add_argument("--announcement", default=str(DEFAULT_PRODUCT_ANNOUNCEMENT_PATH))
+    sync_latest_json.add_argument("--protocol", type=int)
     sync_latest_json.set_defaults(func=cmd_sync_latest_json)
+
+    validate_product_announcement = subparsers.add_parser(
+        "validate-product-announcement",
+        help="Validate docs/next product announcement JSON",
+    )
+    validate_product_announcement.add_argument(
+        "--path", default=str(DEFAULT_PRODUCT_ANNOUNCEMENT_PATH)
+    )
+    validate_product_announcement.set_defaults(func=cmd_validate_product_announcement)
 
     verify_release_state = subparsers.add_parser(
         "verify-release-state",
@@ -494,6 +651,7 @@ def build_parser() -> argparse.ArgumentParser:
     verify_release_state.add_argument("--repo", default=DEFAULT_RELEASE_REPO)
     verify_release_state.add_argument("--output", default=str(DEFAULT_LATEST_JSON_PATH))
     verify_release_state.add_argument("--live-url", default=DEFAULT_LIVE_MANIFEST_URL)
+    verify_release_state.add_argument("--protocol", type=int)
     verify_release_state.set_defaults(func=cmd_verify_release_state)
 
     return parser

@@ -24,13 +24,16 @@ pub enum Agent {
     Codex,
     Gemini,
     Cursor,
+    Antigravity,
     Cline,
     OpenCode,
     GithubCopilot,
     Kimi,
+    Kiro,
     Droid,
     Amp,
     Grok,
+    Hermes,
 }
 
 pub fn agent_label(agent: Agent) -> &'static str {
@@ -40,13 +43,16 @@ pub fn agent_label(agent: Agent) -> &'static str {
         Agent::Codex => "codex",
         Agent::Gemini => "gemini",
         Agent::Cursor => "cursor",
+        Agent::Antigravity => "agy",
         Agent::Cline => "cline",
         Agent::OpenCode => "opencode",
         Agent::GithubCopilot => "copilot",
         Agent::Kimi => "kimi",
+        Agent::Kiro => "kiro",
         Agent::Droid => "droid",
         Agent::Amp => "amp",
         Agent::Grok => "grok",
+        Agent::Hermes => "hermes",
     }
 }
 
@@ -57,14 +63,17 @@ pub fn parse_agent_label(agent: &str) -> Option<Agent> {
         "claude" | "claude-code" => Some(Agent::Claude),
         "codex" => Some(Agent::Codex),
         "gemini" => Some(Agent::Gemini),
-        "cursor" => Some(Agent::Cursor),
+        "cursor" | "cursor-agent" => Some(Agent::Cursor),
+        "agy" | "antigravity" | "antigravity-cli" => Some(Agent::Antigravity),
         "cline" => Some(Agent::Cline),
         "opencode" | "open-code" => Some(Agent::OpenCode),
         "copilot" | "github-copilot" | "ghcs" => Some(Agent::GithubCopilot),
         "kimi" => Some(Agent::Kimi),
+        "kiro" | "kiro-cli" => Some(Agent::Kiro),
         "droid" => Some(Agent::Droid),
         "amp" | "amp-local" => Some(Agent::Amp),
         "grok" | "grok-build" => Some(Agent::Grok),
+        "hermes" | "hermes-agent" => Some(Agent::Hermes),
         _ => None,
     }
 }
@@ -79,19 +88,33 @@ pub fn identify_agent(process_name: &str) -> Option<Agent> {
         "claude" | "claude-code" => Some(Agent::Claude),
         "codex" => Some(Agent::Codex),
         "gemini" => Some(Agent::Gemini),
-        "cursor" => Some(Agent::Cursor),
+        "cursor" | "cursor-agent" => Some(Agent::Cursor),
+        "agy" | "antigravity" | "antigravity-cli" => Some(Agent::Antigravity),
         "cline" => Some(Agent::Cline),
         "opencode" | "open-code" => Some(Agent::OpenCode),
         "copilot" | "github-copilot" | "ghcs" => Some(Agent::GithubCopilot),
         "kimi" => Some(Agent::Kimi),
+        "kiro" | "kiro-cli" => Some(Agent::Kiro),
         "droid" => Some(Agent::Droid),
         "amp" | "amp-local" => Some(Agent::Amp),
         "grok" | "grok-build" => Some(Agent::Grok),
+        "hermes" | "hermes-agent" => Some(Agent::Hermes),
         _ => None,
     }
 }
 
 pub fn identify_agent_in_job(job: &crate::platform::ForegroundJob) -> Option<(Agent, String)> {
+    if let Some(process) = job
+        .processes
+        .iter()
+        .find(|process| process.pid == job.process_group_id)
+    {
+        let candidate = normalized_process_name(process);
+        if let Some(agent) = identify_agent(&candidate) {
+            return Some((agent, candidate));
+        }
+    }
+
     let mut best: Option<(u8, Agent, String)> = None;
 
     for process in &job.processes {
@@ -122,13 +145,16 @@ pub fn detect_state(agent: Option<Agent>, screen_content: &str) -> AgentState {
         Agent::Codex => detect_codex(screen_content),
         Agent::Gemini => detect_gemini(screen_content),
         Agent::Cursor => detect_cursor(screen_content),
+        Agent::Antigravity => detect_antigravity(screen_content),
         Agent::Cline => detect_cline(screen_content),
         Agent::OpenCode => detect_opencode(screen_content),
         Agent::GithubCopilot => detect_github_copilot(screen_content),
         Agent::Kimi => detect_kimi(screen_content),
+        Agent::Kiro => detect_kiro(screen_content),
         Agent::Droid => detect_droid(screen_content),
         Agent::Amp => detect_amp(screen_content),
         Agent::Grok => detect_grok(screen_content),
+        Agent::Hermes => detect_hermes(screen_content),
     }
 }
 
@@ -244,14 +270,7 @@ fn detect_cursor(content: &str) -> AgentState {
     let lower = content.to_lowercase();
 
     // Blocked
-    if lower.contains("(y) (enter)")
-        || lower.contains("keep (n)")
-        || lower.contains("skip (esc or n)")
-    {
-        return AgentState::Blocked;
-    }
-    // "allow ...(y)" or "run ...(y)" patterns
-    if lower.contains("(y)") && (lower.contains("allow") || lower.contains("run")) {
+    if has_cursor_blocked_prompt(content, &lower) {
         return AgentState::Blocked;
     }
 
@@ -260,6 +279,23 @@ fn detect_cursor(content: &str) -> AgentState {
         return AgentState::Working;
     }
     if has_cursor_spinner(content) {
+        return AgentState::Working;
+    }
+
+    AgentState::Idle
+}
+
+fn detect_antigravity(content: &str) -> AgentState {
+    let lower = content.to_lowercase();
+
+    let has_permission_request = lower.contains("requesting permission for:");
+    let has_permission_question = lower.contains("do you want to proceed?");
+    let has_permission_controls = lower.contains("tab amend") && lower.contains("edit command");
+    if has_permission_request && (has_permission_question || has_permission_controls) {
+        return AgentState::Blocked;
+    }
+
+    if has_antigravity_spinner(content) || has_antigravity_background_tasks(content) {
         return AgentState::Working;
     }
 
@@ -341,6 +377,23 @@ fn detect_kimi(content: &str) -> AgentState {
         || lower.contains("waiting for response")
         || lower.contains("ctrl+c to cancel")
         || lower.contains("ctrl-c to cancel")
+    {
+        return AgentState::Working;
+    }
+
+    AgentState::Idle
+}
+
+/// Kiro CLI detection.
+///
+/// Kiro exposes reliable working and idle terminal markers. Confirmation
+/// prompts currently render as normal inline conversation followed by the input
+/// prompt, so they are intentionally treated as idle instead of guessing.
+fn detect_kiro(content: &str) -> AgentState {
+    let lower = content.to_lowercase();
+
+    if lower.contains("kiro is working")
+        || (lower.contains("esc to cancel") && has_kiro_tool_spinner(content))
     {
         return AgentState::Working;
     }
@@ -461,6 +514,31 @@ fn detect_grok(content: &str) -> AgentState {
     AgentState::Idle
 }
 
+/// Hermes Agent detection.
+///
+/// Hermes shows a bottom status bar while turns are active and modal approval
+/// dialogs for dangerous terminal commands. Prefer the modal controls for
+/// blocked detection, then the live interrupt/status controls for working.
+fn detect_hermes(content: &str) -> AgentState {
+    let lower = content.to_lowercase();
+
+    let has_approval_options = lower.contains("allow once")
+        && lower.contains("allow for this session")
+        && lower.contains("deny");
+    let has_approval_controls = lower.contains("enter to confirm")
+        || lower.contains("↑/↓ to select")
+        || lower.contains("show full command");
+    if (lower.contains("dangerous command") || has_approval_options) && has_approval_controls {
+        return AgentState::Blocked;
+    }
+
+    if lower.contains("msg=interrupt") || lower.contains("ctrl+c cancel") {
+        return AgentState::Working;
+    }
+
+    AgentState::Idle
+}
+
 /// Check for braille spinner characters at the start of a line.
 /// These are the Unicode braille pattern dots used by CLI spinners.
 fn has_braille_spinner(content: &str) -> bool {
@@ -473,6 +551,21 @@ fn has_braille_spinner(content: &str) -> bool {
         }
     }
     false
+}
+
+fn has_kiro_tool_spinner(content: &str) -> bool {
+    content.lines().any(|line| {
+        let trimmed = line.trim_start();
+        let mut chars = trimmed.chars();
+        let Some(first) = chars.next() else {
+            return false;
+        };
+        if !matches!(first, '◔' | '◑' | '◕' | '●') {
+            return false;
+        }
+        let rest = chars.as_str().trim_start();
+        rest.chars().next().is_some_and(char::is_alphabetic)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -576,15 +669,105 @@ fn has_codex_working_header(content: &str) -> bool {
     })
 }
 
-/// Cursor spinner: ⬡ or ⬢ followed by a word ending in "ing"
+fn has_cursor_blocked_prompt(content: &str, lower: &str) -> bool {
+    if lower.contains("waiting for approval") || lower.contains("run this command?") {
+        return true;
+    }
+
+    if lower.contains("(y) (enter)")
+        || lower.contains("keep (n)")
+        || lower.contains("skip (esc or n)")
+    {
+        return true;
+    }
+
+    content.lines().any(|line| {
+        let line = line.trim().to_lowercase();
+        let has_yes_action = line.contains("(y)");
+        has_yes_action
+            && (line.contains("allow")
+                || line.contains("run (once)")
+                || line.contains("→ run")
+                || line.starts_with("run "))
+    })
+}
+
+/// Cursor status line: spinner glyphs followed by a live action label.
 fn has_cursor_spinner(content: &str) -> bool {
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if (trimmed.starts_with('⬡') || trimmed.starts_with('⬢')) && trimmed.contains("ing") {
-            return true;
+    content.lines().any(|line| {
+        let trimmed = line.trim_start();
+        let mut chars = trimmed.chars();
+        let Some(first) = chars.next() else {
+            return false;
+        };
+        let rest = chars.as_str().trim_start();
+
+        if matches!(first, '⬡' | '⬢') {
+            return cursor_status_word_is_active(rest);
+        }
+
+        if ('\u{2800}'..='\u{28FF}').contains(&first) {
+            let rest = rest.trim_start_matches(|c| ('\u{2800}'..='\u{28FF}').contains(&c));
+            return cursor_status_word_is_active(rest.trim_start());
+        }
+
+        false
+    })
+}
+
+fn cursor_status_word_is_active(rest: &str) -> bool {
+    let Some(word) = rest.split_whitespace().next() else {
+        return false;
+    };
+    word.trim_end_matches(|c: char| !c.is_alphabetic())
+        .to_ascii_lowercase()
+        .ends_with("ing")
+}
+
+fn has_antigravity_spinner(content: &str) -> bool {
+    content.lines().any(|line| {
+        let trimmed = line.trim_start();
+        let mut chars = trimmed.chars();
+        let Some(first) = chars.next() else {
+            return false;
+        };
+        if !('\u{2800}'..='\u{28FF}').contains(&first) {
+            return false;
+        }
+
+        let rest = chars
+            .as_str()
+            .trim_start_matches(|c| ('\u{2800}'..='\u{28FF}').contains(&c))
+            .trim_start();
+        cursor_status_word_is_active(rest)
+    })
+}
+
+fn has_antigravity_background_tasks(content: &str) -> bool {
+    let bottom_lines: Vec<&str> = content
+        .lines()
+        .rev()
+        .filter(|line| !line.trim().is_empty())
+        .take(5)
+        .collect();
+
+    bottom_lines.into_iter().any(|line| {
+        let line = line.trim().to_lowercase();
+        line.contains("/tasks") && antigravity_task_count(&line).is_some_and(|count| count > 0)
+    })
+}
+
+fn antigravity_task_count(line: &str) -> Option<u32> {
+    for marker in [" task(s)", " tasks", " task"] {
+        let Some((before, _)) = line.split_once(marker) else {
+            continue;
+        };
+        let raw_count = before.split_whitespace().last()?.trim_matches(|c| c == '·');
+        if let Ok(count) = raw_count.parse() {
+            return Some(count);
         }
     }
-    false
+    None
 }
 
 fn has_opencode_question_prompt(content: &str) -> bool {
@@ -724,26 +907,38 @@ mod tests {
         assert_eq!(identify_agent("codex"), Some(Agent::Codex));
         assert_eq!(identify_agent("gemini"), Some(Agent::Gemini));
         assert_eq!(identify_agent("cursor"), Some(Agent::Cursor));
+        assert_eq!(identify_agent("cursor-agent"), Some(Agent::Cursor));
+        assert_eq!(identify_agent("agy"), Some(Agent::Antigravity));
+        assert_eq!(identify_agent("antigravity-cli"), Some(Agent::Antigravity));
         assert_eq!(identify_agent("cline"), Some(Agent::Cline));
         assert_eq!(identify_agent("opencode"), Some(Agent::OpenCode));
         assert_eq!(identify_agent("kimi"), Some(Agent::Kimi));
+        assert_eq!(identify_agent("kiro"), Some(Agent::Kiro));
+        assert_eq!(identify_agent("kiro-cli"), Some(Agent::Kiro));
         assert_eq!(identify_agent("copilot"), Some(Agent::GithubCopilot));
         assert_eq!(identify_agent("ghcs"), Some(Agent::GithubCopilot));
         assert_eq!(identify_agent("grok"), Some(Agent::Grok));
         assert_eq!(identify_agent("grok-build"), Some(Agent::Grok));
+        assert_eq!(identify_agent("hermes"), Some(Agent::Hermes));
+        assert_eq!(identify_agent("hermes-agent"), Some(Agent::Hermes));
     }
 
     #[test]
     fn parse_known_agent_labels() {
         assert_eq!(parse_agent_label("pi"), Some(Agent::Pi));
         assert_eq!(parse_agent_label("claude"), Some(Agent::Claude));
+        assert_eq!(parse_agent_label("cursor-agent"), Some(Agent::Cursor));
+        assert_eq!(parse_agent_label("agy"), Some(Agent::Antigravity));
+        assert_eq!(parse_agent_label("antigravity"), Some(Agent::Antigravity));
         assert_eq!(parse_agent_label("copilot"), Some(Agent::GithubCopilot));
         assert_eq!(
             parse_agent_label("github-copilot"),
             Some(Agent::GithubCopilot)
         );
         assert_eq!(parse_agent_label("amp-local"), Some(Agent::Amp));
+        assert_eq!(parse_agent_label("kiro-cli"), Some(Agent::Kiro));
         assert_eq!(parse_agent_label("grok-build"), Some(Agent::Grok));
+        assert_eq!(parse_agent_label("hermes-agent"), Some(Agent::Hermes));
     }
 
     #[test]
@@ -751,7 +946,10 @@ mod tests {
         assert_eq!(agent_label(Agent::Pi), "pi");
         assert_eq!(agent_label(Agent::GithubCopilot), "copilot");
         assert_eq!(agent_label(Agent::OpenCode), "opencode");
+        assert_eq!(agent_label(Agent::Antigravity), "agy");
+        assert_eq!(agent_label(Agent::Kiro), "kiro");
         assert_eq!(agent_label(Agent::Grok), "grok");
+        assert_eq!(agent_label(Agent::Hermes), "hermes");
     }
 
     #[test]
@@ -785,6 +983,58 @@ mod tests {
                     name: "bash".to_string(),
                     argv0: None,
                     cmdline: Some("bash".to_string()),
+                },
+            ],
+        };
+
+        assert_eq!(
+            identify_agent_in_job(&job),
+            Some((Agent::Codex, "codex".to_string()))
+        );
+    }
+
+    #[test]
+    fn identify_agent_in_job_prefers_recognized_process_group_leader() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 42,
+            processes: vec![
+                crate::platform::ForegroundProcess {
+                    pid: 42,
+                    name: "claude".to_string(),
+                    argv0: None,
+                    cmdline: Some("claude".to_string()),
+                },
+                crate::platform::ForegroundProcess {
+                    pid: 43,
+                    name: "node".to_string(),
+                    argv0: None,
+                    cmdline: Some("node /tmp/mcp/bin/codex".to_string()),
+                },
+            ],
+        };
+
+        assert_eq!(
+            identify_agent_in_job(&job),
+            Some((Agent::Claude, "claude".to_string()))
+        );
+    }
+
+    #[test]
+    fn identify_agent_in_job_falls_back_when_process_group_leader_is_unrecognized() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 42,
+            processes: vec![
+                crate::platform::ForegroundProcess {
+                    pid: 42,
+                    name: "bash".to_string(),
+                    argv0: None,
+                    cmdline: Some("bash".to_string()),
+                },
+                crate::platform::ForegroundProcess {
+                    pid: 43,
+                    name: "node".to_string(),
+                    argv0: None,
+                    cmdline: Some("node /tmp/mcp/bin/codex".to_string()),
                 },
             ],
         };
@@ -1103,6 +1353,35 @@ mod tests {
     }
 
     #[test]
+    fn cursor_working_braille_status() {
+        assert_eq!(
+            detect_cursor("⠠⠜ Running  5.52k tokens"),
+            AgentState::Working
+        );
+        assert_eq!(
+            detect_cursor("⠞ Working  5.62k tokens"),
+            AgentState::Working
+        );
+        assert_eq!(
+            detect_cursor("⠛ Grepping  1.2k tokens"),
+            AgentState::Working
+        );
+    }
+
+    #[test]
+    fn cursor_blocked_command_approval() {
+        let screen =
+            "Waiting for approval...\nRun this command?\n→ Run (once) (y)\nSkip (esc or n)";
+        assert_eq!(detect_cursor(screen), AgentState::Blocked);
+    }
+
+    #[test]
+    fn cursor_running_text_with_unrelated_yes_is_not_blocked() {
+        let screen = "previous answer mentioned (y)\n⠠⠜ Running  5.52k tokens";
+        assert_eq!(detect_cursor(screen), AgentState::Working);
+    }
+
+    #[test]
     fn cursor_working_ctrl_c() {
         assert_eq!(
             detect_cursor("processing\nctrl+c to stop"),
@@ -1113,6 +1392,71 @@ mod tests {
     #[test]
     fn cursor_idle() {
         assert_eq!(detect_cursor("> "), AgentState::Idle);
+    }
+
+    // ---- Antigravity ----
+
+    #[test]
+    fn antigravity_blocked_permission_prompt() {
+        let screen = "Requesting permission for: git log -n 50\nDo you want to proceed?\n> 1. Yes\n↑/↓ Navigate · tab Amend · e edit command";
+        assert_eq!(detect_antigravity(screen), AgentState::Blocked);
+    }
+
+    #[test]
+    fn antigravity_question_without_permission_request_stays_idle() {
+        assert_eq!(
+            detect_antigravity("Do you want to proceed?\n>"),
+            AgentState::Idle
+        );
+    }
+
+    #[test]
+    fn antigravity_working_spinner() {
+        assert_eq!(detect_antigravity("⡿ Working..."), AgentState::Working);
+        assert_eq!(detect_antigravity("⣯ Loading..."), AgentState::Working);
+        assert_eq!(detect_antigravity("⢿ Generating..."), AgentState::Working);
+        assert_eq!(detect_antigravity("⣷ Running..."), AgentState::Working);
+    }
+
+    #[test]
+    fn antigravity_background_task_footer_is_working() {
+        let screen = "? for shortcuts     Gemini 3.5 Flash (High) · 1 task(s) · /tasks";
+        assert_eq!(detect_antigravity(screen), AgentState::Working);
+    }
+
+    #[test]
+    fn antigravity_background_task_footer_parses_plural_variants() {
+        assert_eq!(
+            detect_antigravity("Gemini 3.5 Flash (High) · 10 task(s) · /tasks"),
+            AgentState::Working
+        );
+        assert_eq!(
+            detect_antigravity("model · 2 tasks · /tasks"),
+            AgentState::Working
+        );
+        assert_eq!(
+            detect_antigravity("model · 1 task · /tasks"),
+            AgentState::Working
+        );
+    }
+
+    #[test]
+    fn antigravity_zero_background_tasks_is_idle() {
+        let screen = "Gemini 3.5 Flash (High) · 0 task(s) · /tasks";
+        assert_eq!(detect_antigravity(screen), AgentState::Idle);
+    }
+
+    #[test]
+    fn antigravity_task_text_outside_bottom_footer_is_idle() {
+        let screen =
+            "User said the footer had /tasks and 1 task(s)\nline 1\nline 2\nline 3\nline 4\nline 5";
+        assert_eq!(detect_antigravity(screen), AgentState::Idle);
+    }
+
+    #[test]
+    fn antigravity_idle_prompt() {
+        let screen = "Antigravity CLI\n────────────────\n>\n────────────────\n? for shortcuts";
+        assert_eq!(detect_antigravity(screen), AgentState::Idle);
     }
 
     // ---- Cline ----
@@ -1245,6 +1589,38 @@ mod tests {
     #[test]
     fn kimi_idle() {
         assert_eq!(detect_kimi("> "), AgentState::Idle);
+    }
+
+    // ---- Kiro ----
+
+    #[test]
+    fn kiro_working_on_status_bar() {
+        let screen = "◕ Shell\n  esc to cancel\n● 1 MCP failure — see /mcp\n─────────────────────────────────────────────────────\nKiro · auto · ◔ 6%                                  ~\n\n Kiro is working · type to queue a message";
+        assert_eq!(detect_state(Some(Agent::Kiro), screen), AgentState::Working);
+    }
+
+    #[test]
+    fn kiro_working_on_tool_spinner_and_cancel_hint() {
+        let screen = "◕ Shell\n  esc to cancel\n─────────────────────────────────────────────────────\nKiro · auto · ◔ 6%";
+        assert_eq!(detect_state(Some(Agent::Kiro), screen), AgentState::Working);
+    }
+
+    #[test]
+    fn kiro_idle_at_prompt() {
+        let screen = "● 1 MCP failure — see /mcp\n──────────────────────────────────────────────────────────────────────────────────────\nKiro · auto · ◔ 6%                                                                   ~\n\n ask a question or describe a task ↵\n                                                                   /copy to clipboard";
+        assert_eq!(detect_state(Some(Agent::Kiro), screen), AgentState::Idle);
+    }
+
+    #[test]
+    fn kiro_does_not_treat_stale_failure_spinner_as_working() {
+        let screen = "● 1 MCP failure — see /mcp\n─────────────────────────────────────────────────────\nKiro · auto · ◔ 6%\n\n ask a question or describe a task ↵";
+        assert_eq!(detect_state(Some(Agent::Kiro), screen), AgentState::Idle);
+    }
+
+    #[test]
+    fn kiro_identified_by_process_name() {
+        assert_eq!(identify_agent("kiro"), Some(Agent::Kiro));
+        assert_eq!(identify_agent("kiro-cli"), Some(Agent::Kiro));
     }
 
     // ---- Droid ----
@@ -1405,6 +1781,50 @@ mod tests {
         assert_eq!(detect_state(Some(Agent::Grok), screen), AgentState::Idle);
     }
 
+    // ---- Hermes ----
+
+    #[test]
+    fn hermes_identified_by_process_name() {
+        assert_eq!(identify_agent("hermes"), Some(Agent::Hermes));
+        assert_eq!(identify_agent("hermes-agent"), Some(Agent::Hermes));
+    }
+
+    #[test]
+    fn hermes_working_on_interrupt_footer() {
+        let screen = "  (⌐■_■) computing...\n\n ⚕ gpt-5.5 │ 15.5K/272K │ [█░░░░░░░░░] 6% │ 2m │ ⏱ 3s\n─────────────────────────────────────────────────────────────────────────────────────────\n⚕ ❯ msg=interrupt · /queue · /bg · /steer · Ctrl+C cancel";
+        assert_eq!(
+            detect_state(Some(Agent::Hermes), screen),
+            AgentState::Working
+        );
+    }
+
+    #[test]
+    fn hermes_idle_ignores_stale_initializing_agent_text() {
+        let screen = "● say exactly READY and stop\nInitializing agent...\n\n╭─ ⚕ Hermes ────────────────────────────────────────────────────────────────────────────╮\n    READY\n╰───────────────────────────────────────────────────────────────────────────────────────╯\n ⚕ gpt-5.5 │ 15.5K/272K │ [█░░░░░░░░░] 6% │ 15s │ ⏲ 2s\n─────────────────────────────────────────────────────────────────────────────────────────\n❯";
+        assert_eq!(detect_state(Some(Agent::Hermes), screen), AgentState::Idle);
+    }
+
+    #[test]
+    fn hermes_blocked_on_dangerous_command_prompt() {
+        let screen = "╭────────────────────────────────────────────────────────────╮\n│ ⚠️  Dangerous Command                                      │\n│ mkdir -p /tmp/herdr-hermes-block-test/subdir && touch      │\n│ ❯ 1. Allow once                                            │\n│   2. Allow for this session                                │\n│   3. Add to permanent allowlist                            │\n│   4. Deny                                                  │\n│   5. Show full command                                     │\n╰────────────────────────────────────────────────────────────╯\n  ↑/↓ to select, Enter to confirm\n⚠ ❯";
+        assert_eq!(
+            detect_state(Some(Agent::Hermes), screen),
+            AgentState::Blocked
+        );
+    }
+
+    #[test]
+    fn hermes_idle_at_prompt_after_response() {
+        let screen = "╭─ ⚕ Hermes ────────────────────────────────────────────────────────────────────────────╮\n    READY\n╰───────────────────────────────────────────────────────────────────────────────────────╯\n ⚕ gpt-5.5 │ 15.5K/272K │ [█░░░░░░░░░] 6% │ 15s │ ⏲ 2s\n─────────────────────────────────────────────────────────────────────────────────────────\n❯\n─────────────────────────────────────────────────────────────────────────────────────────";
+        assert_eq!(detect_state(Some(Agent::Hermes), screen), AgentState::Idle);
+    }
+
+    #[test]
+    fn hermes_denied_message_is_idle() {
+        let screen = "╭─ ⚕ Hermes ────────────────────────────────────────────────────────────────────────────╮\n    Command was blocked/denied by the safety layer. I did not retry.\n╰───────────────────────────────────────────────────────────────────────────────────────╯\n ⚕ gpt-5.5 │ 15.4K/272K │ [█░░░░░░░░░] 6% │ 2m │ ⏲ 11s\n─────────────────────────────────────────────────────────────────────────────────────────\n❯";
+        assert_eq!(detect_state(Some(Agent::Hermes), screen), AgentState::Idle);
+    }
+
     // ---- Helpers ----
 
     #[test]
@@ -1445,12 +1865,17 @@ mod tests {
     fn cursor_spinner_detected() {
         assert!(has_cursor_spinner("⬡ Grepping.."));
         assert!(has_cursor_spinner("⬢ Reading…"));
+        assert!(has_cursor_spinner("⠠⠜ Running  5.52k tokens"));
+        assert!(has_cursor_spinner("⠞ Working  5.62k tokens"));
+        assert!(has_cursor_spinner("⠛ Grepping  1.2k tokens"));
+        assert!(has_cursor_spinner("⠛ Analyzing  1.2k tokens"));
     }
 
     #[test]
     fn cursor_spinner_not_false_positive() {
         assert!(!has_cursor_spinner("normal text"));
         assert!(!has_cursor_spinner("some ⬡ in middle"));
+        assert!(!has_cursor_spinner("⠛ Read notes"));
     }
 
     // ---- Process identification (real PTY) ----

@@ -2,6 +2,63 @@
 
 ## Unreleased
 
+## [0.6.0] - 2026-05-20
+
+### Added
+- Added keybinding v2 with explicit `prefix+...` syntax, array bindings per action, configurable prefix-mode pane focus, tab switching, and direct modified chords for users who opt in. (#154, #201, #202, #219)
+- Added `herdr config reset-keys` to back up `config.toml` and remove custom keybindings so built-in v2 defaults apply on restart or config reload. (#154)
+- Added an integrations tab in settings and first-run onboarding so users can install recommended agent integrations from inside Herdr.
+- Added update badges on the sidebar menu, settings menu item, and integrations settings tab when installed integrations are outdated.
+- Added `terminal.default_shell` to choose the executable used for new interactive panes. When unset, Herdr still falls back to `$SHELL`, then `/bin/sh`. (#196)
+- Added native Kiro CLI detection with idle and working state heuristics. (#185)
+
+### Fixed
+- Keybinding conflict warnings now stay visible and show one readable yellow row per conflicting binding.
+- Update prompts that need to stop a running server now default Enter to yes and show `[Y/n]`.
+- Pending release notes no longer open automatically on startup; the latest notes remain available from the menu.
+- Running `herdr server` directly now prints socket and log paths and explains that normal TUI users should run `herdr`.
+- Kitty graphics virtual Unicode placeholders now render image placements instead of leaving placeholder cells behind. (#136)
+- Clipboard image reads are now capped to Herdr's image payload limit, preventing oversized local clipboard images from being read into memory.
+- The install script now reads Herdr's public latest-release manifest, so fresh installs use the same binary URLs as `herdr update`.
+- The Claude Code integration no longer lets subagent completion hooks report durable `working`, preventing delayed recap or subagent completion events from reviving an idle pane. (#198)
+- Remote clients now bridge local clipboard images into the remote pane by staging them as temporary image files and pasting the remote path, so Claude Code image paste works over `herdr --remote`. (#205)
+
+### Breaking Changes
+- Removed the separate `keys.quit` binding. Use `keys.detach`, which detaches in server mode and exits in `--no-session` mode. The default detach binding is now `prefix+q`.
+- Keybindings now use explicit trigger syntax: `prefix+c` means prefix mode, while `ctrl+alt+c` is direct. Bare printable direct bindings such as `new_tab = "c"` are rejected with diagnostics because they intercept normal typing. The default keymap now gives tmux-style tab actions to `prefix+c`, `prefix+n`/`prefix+p`, and `prefix+1..9`, uses `prefix+w` for workspace navigation, and moves pane focus to `prefix+h/j/k/l`. (#154)
+- The client/server protocol is now version 8. Stop and restart any running v0.5.12 server before attaching with this release.
+
+## [0.5.12] - 2026-05-19
+
+### Fixed
+- The Claude Code integration no longer reports successful or failed post-tool hooks as `working`, and installing the updated integration removes Herdr's deprecated post-tool hook entries from existing Claude settings. (#198)
+- The Codex integration now reports native `PermissionRequest` hooks as `blocked`, so permission prompts no longer stay pinned as `working` after a tool-use hook. (#198)
+- Workspace and tab rename prompts now handle Backspace, Ctrl+Backspace, Alt+Backspace, Cmd+Backspace, Ctrl+H, Ctrl+W, and Ctrl+U as editing shortcuts instead of inserting stray characters or clearing unexpectedly. (#204)
+
+## [0.5.11] - 2026-05-19
+
+### Added
+- Added the `terminal` built-in theme, which uses the host terminal's ANSI palette for Herdr UI colors. (#140, #146, thanks @babymastodon)
+- Added Hermes Agent foreground-process detection with basic idle, working, and blocked heuristics. (#144)
+- Added a Hermes Agent plugin integration for direct state reporting. (#144)
+- Added `ui.sidebar_min_width` and `ui.sidebar_max_width` to configure the sidebar's expanded resize bounds. Defaults remain 18 and 36 columns; existing configs are unchanged. (#132, #135, thanks @ChihGodlee)
+
+### Fixed
+- Running the internal `herdr client` command from inside Herdr now respects the nested-launch guard, and the command is no longer advertised in root help. (#187)
+- The Herdr agent skill now refuses to claim pane ownership unless it is running inside Herdr. (#152)
+- Terminal-style docs code blocks now keep their copy button in the top-right corner. (#190)
+- The sidebar `new` workspace button now aligns with the sidebar's left padding. (#189)
+- Herdr now preserves `session.json` symlinks when saving persistent session state. (#139, #147, thanks @cloudmanic)
+- Alt+Backspace is now preserved when forwarded into panes. (#155, #165)
+- Directional pane focus now works while a tab is zoomed. (#151, #167)
+- Agent detection now prefers the foreground process group leader, reducing false matches from child helper processes. (#161, #172)
+- Remote attach now uses a matching `herdr` already available on the remote `PATH` before installing a new copy. (#170)
+- Modified Enter input such as Shift+Enter is now preserved in supported terminals. (#168)
+- Sidebar agent entries now show user-assigned agent names when available. (#145)
+
+### Breaking Changes
+- The client/server protocol is now version 7. Stop and restart any running v0.5.10 server before attaching with this release.
+
 ## [0.5.10] - 2026-05-17
 
 ### Added
@@ -143,7 +200,7 @@
 ## [0.5.1] - 2026-04-25
 
 ### Added
-- Toast notifications can now be delivered through the outer terminal as desktop notifications. Configure this with `ui.toast.delivery = "terminal"`; see `CONFIGURATION.md` for details.
+- Toast notifications can now be delivered through the outer terminal as desktop notifications. Configure this with `ui.toast.delivery = "terminal"`; see the [configuration docs](https://herdr.dev/docs/configuration/) for details.
 - Herdr now writes separate capped support logs for app, client, and server modes, making persistent-session issue reports easier to diagnose without unbounded log growth.
 - The bundled opencode plugin now reports question prompts as blocked while waiting for user input, then returns to working or idle when answered or dismissed. Question prompts are also detected by the default terminal-screen heuristics. (#51, thanks @mspiegel31)
 
@@ -420,7 +477,7 @@
 ### Added
 - Added first-run onboarding flow that lets you choose notification preferences (sound and toast) on startup.
 - Added optional visual toast notifications in the top-right corner for background workspace events (completion and attention-needed alerts).
-- Added configurable keybindings for all navigate mode actions: new workspace, rename workspace, close workspace, resize mode, and toggle sidebar. See `CONFIGURATION.md` for the full key reference.
+- Added configurable keybindings for all navigate mode actions: new workspace, rename workspace, close workspace, resize mode, and toggle sidebar. See the [configuration docs](https://herdr.dev/docs/configuration/) for the full key reference.
 - Added configuration validation with startup diagnostics. Invalid key combinations or duplicate bindings now fall back to safe defaults with a visible warning.
 
 ### Changed
@@ -431,7 +488,7 @@
 - Keybinding parser now accepts special keys (`enter`, `esc`, `tab`, `backspace`, `space`) and function keys (`f1`–`f12`).
 
 ### Documentation
-- Split configuration reference into a dedicated `CONFIGURATION.md` file with full keybinding documentation and config diagnostics explanation.
+- Split configuration reference into dedicated configuration docs with full keybinding documentation and config diagnostics explanation.
 
 ## [0.1.1] - 2026-03-28
 

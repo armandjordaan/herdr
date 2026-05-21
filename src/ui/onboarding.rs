@@ -78,7 +78,7 @@ fn render_onboarding_welcome(app: &AppState, frame: &mut Frame, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            " enters navigate mode · ",
+            " enters prefix mode · ",
             Style::default().fg(app.palette.overlay1),
         ),
         Span::styled(
@@ -93,6 +93,12 @@ fn render_onboarding_welcome(app: &AppState, frame: &mut Frame, area: Rect) {
         ),
     ]);
     frame.render_widget(Paragraph::new(key_line), content_rows[2]);
+
+    frame.render_widget(
+        Paragraph::new("  next: install optional agent integrations for more reliable state")
+            .style(Style::default().fg(app.palette.overlay1)),
+        content_rows[3],
+    );
 
     let continue_rect = onboarding_welcome_continue_rect(stack.actions.unwrap_or_default());
     render_action_button(

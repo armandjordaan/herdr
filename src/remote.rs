@@ -13,11 +13,14 @@ use std::sync::{
     Arc,
 };
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const BRIDGE_ACCEPT_POLL: Duration = Duration::from_millis(50);
 const BRIDGE_SOCKET_PERMISSION_MODE: u32 = 0o600;
+const REMOTE_SERVER_SHUTDOWN_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
+const REMOTE_SERVER_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+const CURRENT_PROTOCOL: u32 = crate::server::protocol::PROTOCOL_VERSION;
 const UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
 const REMOTE_BINARY_ENV_VAR: &str = "HERDR_REMOTE_BINARY";
 pub(crate) const REATTACH_COMMAND_ENV_VAR: &str = "HERDR_REATTACH_COMMAND";
@@ -88,11 +91,16 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         .next()
         .unwrap_or_else(|| "herdr".to_string());
     let reattach_command = reattach_command(&program, &remote.target, &session_name);
-    let remote_herdr = prepare_remote_herdr(&remote.target)?;
+    let prepared_remote = prepare_remote_herdr(&remote.target)?;
+    ensure_remote_server_ready(
+        &remote.target,
+        &prepared_remote.remote_herdr,
+        prepared_remote.installed_or_replaced,
+    )?;
 
     let _bridge = SshStdioBridge::start(
         remote.target,
-        remote_herdr,
+        prepared_remote.remote_herdr,
         local_socket.clone(),
         session_name,
     )?;
@@ -130,7 +138,18 @@ pub(crate) fn run_remote_client_bridge() -> io::Result<()> {
 fn ensure_remote_server_running() -> io::Result<()> {
     let socket_path = crate::server::headless::client_socket_path();
     if crate::server::autodetect::is_server_listening() {
-        return Ok(());
+        let status = crate::api::read_runtime_status_at(
+            &crate::api::socket_path(),
+            Duration::from_millis(500),
+        )?
+        .ok_or_else(|| io::Error::other("remote server status API is unavailable"))?;
+        if status.protocol == Some(CURRENT_PROTOCOL) {
+            return Ok(());
+        }
+        return Err(io::Error::other(format!(
+            "remote herdr server is running with protocol {}, but this bridge needs protocol {CURRENT_PROTOCOL}; rerun `herdr --remote` from an interactive terminal to approve stopping it",
+            protocol_label(status.protocol)
+        )));
     }
 
     crate::server::autodetect::spawn_server_daemon()?;
@@ -200,6 +219,11 @@ impl RemoteHerdr {
             platform,
         }
     }
+
+    fn with_shell_path(mut self, shell_path: String) -> Self {
+        self.shell_path = shell_path;
+        self
+    }
 }
 
 #[derive(Deserialize)]
@@ -211,6 +235,11 @@ struct RemoteUpdateManifest {
 struct InstallSource {
     path: PathBuf,
     temporary_dir: Option<PathBuf>,
+}
+
+struct PreparedRemoteHerdr {
+    remote_herdr: RemoteHerdr,
+    installed_or_replaced: bool,
 }
 
 impl InstallSource {
@@ -235,13 +264,24 @@ impl InstallSource {
     }
 }
 
-fn prepare_remote_herdr(target: &str) -> io::Result<RemoteHerdr> {
+fn prepare_remote_herdr(target: &str) -> io::Result<PreparedRemoteHerdr> {
     let platform = detect_remote_platform(target)?;
     let remote_herdr = RemoteHerdr::for_platform(platform);
     let override_binary = remote_binary_override_path()?;
 
-    if override_binary.is_none() && remote_binary_matches(target, &remote_herdr)? {
-        return Ok(remote_herdr);
+    if override_binary.is_none() {
+        if let Some(path_remote_herdr) = remote_binary_on_path(target, &remote_herdr)? {
+            return Ok(PreparedRemoteHerdr {
+                remote_herdr: path_remote_herdr,
+                installed_or_replaced: false,
+            });
+        }
+        if remote_binary_matches(target, &remote_herdr)? {
+            return Ok(PreparedRemoteHerdr {
+                remote_herdr,
+                installed_or_replaced: false,
+            });
+        }
     }
 
     confirm_remote_install(
@@ -261,8 +301,12 @@ fn prepare_remote_herdr(target: &str) -> io::Result<RemoteHerdr> {
         )));
     }
     warn_if_remote_bin_not_on_path(target)?;
+    maybe_copy_local_keybindings_to_remote(target, &remote_herdr)?;
 
-    Ok(remote_herdr)
+    Ok(PreparedRemoteHerdr {
+        remote_herdr,
+        installed_or_replaced: true,
+    })
 }
 
 fn detect_remote_platform(target: &str) -> io::Result<RemotePlatform> {
@@ -284,15 +328,60 @@ fn detect_remote_platform(target: &str) -> io::Result<RemotePlatform> {
     })
 }
 
+fn remote_binary_on_path(
+    target: &str,
+    remote_herdr: &RemoteHerdr,
+) -> io::Result<Option<RemoteHerdr>> {
+    let output = ssh_output(target, remote_path_probe_command())?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(remote_herdr_from_path_probe(remote_herdr, &stdout))
+}
+
+fn remote_path_probe_command() -> &'static str {
+    r#"path=$(command -v herdr) || exit 1
+test -n "$path" || exit 1
+version=$("$path" --version) || exit 1
+status=$("$path" status client) || exit 1
+printf '%s\n%s\n%s\n' "$path" "$version" "$status"
+"#
+}
+
+fn remote_herdr_from_path_probe(remote_herdr: &RemoteHerdr, stdout: &str) -> Option<RemoteHerdr> {
+    let mut lines = stdout.lines();
+    let path = lines.next()?;
+    let version = lines.next()?.trim();
+    let status = lines.collect::<Vec<_>>().join("\n");
+    let protocol = parse_status_protocol(&status)?;
+    if !path.starts_with('/')
+        || version != format!("herdr {CURRENT_VERSION}")
+        || protocol != CURRENT_PROTOCOL
+    {
+        return None;
+    }
+
+    Some(remote_herdr.clone().with_shell_path(shell_quote(path)))
+}
+
 fn remote_binary_matches(target: &str, remote_herdr: &RemoteHerdr) -> io::Result<bool> {
-    let command = format!("test -x {0} && {0} --version", remote_herdr.shell_path);
+    let command = format!(
+        "test -x {0} && {0} --version && {0} status client",
+        remote_herdr.shell_path
+    );
     let output = ssh_output(target, &command)?;
     if !output.status.success() {
         return Ok(false);
     }
 
-    let version = String::from_utf8_lossy(&output.stdout);
-    Ok(version.trim() == format!("herdr {CURRENT_VERSION}"))
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut lines = stdout.lines();
+    let version = lines.next().unwrap_or_default().trim();
+    let status = lines.collect::<Vec<_>>().join("\n");
+    Ok(version == format!("herdr {CURRENT_VERSION}")
+        && parse_status_protocol(&status) == Some(CURRENT_PROTOCOL))
 }
 
 fn remote_binary_override_path() -> io::Result<Option<PathBuf>> {
@@ -358,6 +447,221 @@ fn resolve_install_source(
     }
 
     download_release_asset(platform)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RemoteServerStatus {
+    Running {
+        version: Option<String>,
+        protocol: Option<u32>,
+    },
+    NotRunning,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteServerRestartReason {
+    ProtocolMismatch,
+    BinaryUpdated,
+    VersionMismatch,
+}
+
+fn ensure_remote_server_ready(
+    target: &str,
+    remote_herdr: &RemoteHerdr,
+    remote_binary_changed: bool,
+) -> io::Result<()> {
+    let status = remote_server_status(target, remote_herdr)?;
+    let RemoteServerStatus::Running { version, protocol } = status else {
+        return Ok(());
+    };
+
+    let Some(reason) =
+        remote_server_restart_reason(version.as_deref(), protocol, remote_binary_changed)
+    else {
+        return Ok(());
+    };
+
+    if confirm_remote_server_stop(target, version.as_deref(), protocol, reason)? {
+        stop_remote_server(target, remote_herdr)?;
+    }
+    Ok(())
+}
+
+fn remote_server_restart_reason(
+    version: Option<&str>,
+    protocol: Option<u32>,
+    remote_binary_changed: bool,
+) -> Option<RemoteServerRestartReason> {
+    if protocol != Some(CURRENT_PROTOCOL) {
+        return Some(RemoteServerRestartReason::ProtocolMismatch);
+    }
+    if remote_binary_changed {
+        return Some(RemoteServerRestartReason::BinaryUpdated);
+    }
+    if version != Some(CURRENT_VERSION) {
+        return Some(RemoteServerRestartReason::VersionMismatch);
+    }
+    None
+}
+
+fn remote_server_status(
+    target: &str,
+    remote_herdr: &RemoteHerdr,
+) -> io::Result<RemoteServerStatus> {
+    let command = format!("{} status server", remote_herdr.shell_path);
+    let output = ssh_output(target, &command)?;
+    if !output.status.success() {
+        return Err(command_failed("remote server status failed", &output));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout
+        .lines()
+        .any(|line| line.trim() == "status: not running")
+    {
+        return Ok(RemoteServerStatus::NotRunning);
+    }
+
+    if stdout.lines().any(|line| line.trim() == "status: running") {
+        return Ok(RemoteServerStatus::Running {
+            version: parse_status_version(&stdout).map(str::to_owned),
+            protocol: parse_status_protocol(&stdout),
+        });
+    }
+
+    Err(io::Error::other(format!(
+        "could not parse remote server status from `{}`",
+        stdout.trim()
+    )))
+}
+
+fn parse_status_value<'a>(status: &'a str, key: &str) -> Option<&'a str> {
+    status.lines().find_map(|line| {
+        let line = line.trim();
+        let (found_key, value) = line.split_once(':')?;
+        (found_key == key).then_some(value.trim())
+    })
+}
+
+fn parse_status_version(status: &str) -> Option<&str> {
+    parse_status_value(status, "version")
+}
+
+fn parse_status_protocol(status: &str) -> Option<u32> {
+    parse_status_value(status, "protocol")?.parse().ok()
+}
+
+fn confirm_remote_server_stop(
+    target: &str,
+    version: Option<&str>,
+    protocol: Option<u32>,
+    reason: RemoteServerRestartReason,
+) -> io::Result<bool> {
+    if !io::stdin().is_terminal() {
+        if reason == RemoteServerRestartReason::ProtocolMismatch {
+            return Err(io::Error::other(format!(
+                "remote herdr server on {target} is running with protocol {}, but this client needs protocol {CURRENT_PROTOCOL}; run from an interactive terminal to approve stopping it",
+                protocol_label(protocol)
+            )));
+        }
+
+        eprintln!(
+            "remote herdr server on {target} is still running v{}; it will use v{CURRENT_VERSION} after it restarts.",
+            version_label(version)
+        );
+        return Ok(false);
+    }
+
+    eprintln!("remote herdr server on {target} is currently running:");
+    eprintln!(
+        "  server: v{} protocol {}",
+        version_label(version),
+        protocol_label(protocol)
+    );
+    eprintln!("  prepared binary: v{CURRENT_VERSION} protocol {CURRENT_PROTOCOL}");
+    eprintln!();
+
+    match reason {
+        RemoteServerRestartReason::ProtocolMismatch => {
+            eprintln!(
+                "the remote server protocol does not match this client. the remote server must be stopped before attaching."
+            );
+        }
+        RemoteServerRestartReason::BinaryUpdated => {
+            eprintln!(
+                "the remote herdr binary was installed or replaced. restart the remote server so it uses the prepared binary."
+            );
+        }
+        RemoteServerRestartReason::VersionMismatch => {
+            eprintln!(
+                "the remote server is still running a different herdr version. restart it so it uses the prepared binary."
+            );
+        }
+    }
+
+    let prompt = if reason == RemoteServerRestartReason::ProtocolMismatch {
+        "stop the remote server and continue attaching? [Y/n] "
+    } else {
+        "restart the remote server now? [Y/n] "
+    };
+    eprint!("{prompt}");
+    io::stderr().flush()?;
+
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    let answer = answer.trim().to_ascii_lowercase();
+    if answer == "n" || answer == "no" {
+        if reason == RemoteServerRestartReason::ProtocolMismatch {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "remote herdr server stop cancelled",
+            ));
+        }
+        return Ok(false);
+    }
+
+    Ok(true)
+}
+
+fn stop_remote_server(target: &str, remote_herdr: &RemoteHerdr) -> io::Result<()> {
+    let command = format!("{} server stop", remote_herdr.shell_path);
+    let output = ssh_output(target, &command)?;
+    if !output.status.success() {
+        return Err(command_failed("remote server stop failed", &output));
+    }
+
+    wait_for_remote_server_shutdown(target, remote_herdr)?;
+    eprintln!("stopped the remote herdr server on {target}; it will restart when the remote client bridge attaches.");
+    Ok(())
+}
+
+fn wait_for_remote_server_shutdown(target: &str, remote_herdr: &RemoteHerdr) -> io::Result<()> {
+    let deadline = Instant::now() + REMOTE_SERVER_SHUTDOWN_CONFIRM_TIMEOUT;
+    loop {
+        if remote_server_status(target, remote_herdr)? == RemoteServerStatus::NotRunning {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "shutdown was requested, but the old remote herdr server on {target} is still responding after {} seconds",
+                    REMOTE_SERVER_SHUTDOWN_CONFIRM_TIMEOUT.as_secs()
+                ),
+            ));
+        }
+        thread::sleep(REMOTE_SERVER_SHUTDOWN_POLL_INTERVAL);
+    }
+}
+
+fn version_label(version: Option<&str>) -> &str {
+    version.unwrap_or("unknown")
+}
+
+fn protocol_label(protocol: Option<u32>) -> String {
+    protocol
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn warn_if_remote_bin_not_on_path(target: &str) -> io::Result<()> {
@@ -481,6 +785,131 @@ fn confirm_remote_install(
     }
 
     Ok(())
+}
+
+fn maybe_copy_local_keybindings_to_remote(
+    target: &str,
+    remote_herdr: &RemoteHerdr,
+) -> io::Result<()> {
+    let Some(config_toml) = local_keybindings_config_toml()? else {
+        return Ok(());
+    };
+    let remote_config_path = remote_config_path(target, remote_herdr)?;
+    if remote_path_exists(target, &remote_config_path)? {
+        return Ok(());
+    }
+    if !confirm_remote_keybindings_copy(target)? {
+        return Ok(());
+    }
+    upload_remote_config(target, &remote_config_path, config_toml.as_bytes())
+}
+
+fn local_keybindings_config_toml() -> io::Result<Option<String>> {
+    let path = crate::config::config_path();
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = fs::read_to_string(&path)?;
+    Ok(local_keybindings_config_toml_from_str(&content))
+}
+
+fn local_keybindings_config_toml_from_str(content: &str) -> Option<String> {
+    let mut value = content.parse::<toml::Value>().ok()?;
+    let root = value.as_table_mut()?;
+    let mut keys = root.remove("keys")?.as_table()?.clone();
+    keys.remove("command");
+    if keys.is_empty() {
+        return None;
+    }
+
+    let mut out = toml::map::Map::new();
+    out.insert("keys".to_string(), toml::Value::Table(keys));
+    toml::to_string_pretty(&toml::Value::Table(out)).ok()
+}
+
+fn remote_config_path(target: &str, remote_herdr: &RemoteHerdr) -> io::Result<String> {
+    let command = format!("{} --help", remote_herdr.shell_path);
+    let output = ssh_output(target, &command)?;
+    if !output.status.success() {
+        return Err(command_failed("remote config path probe failed", &output));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Config: ").map(str::to_string))
+        .ok_or_else(|| io::Error::other("remote config path probe did not print a Config line"))
+}
+
+fn remote_path_exists(target: &str, path: &str) -> io::Result<bool> {
+    let command = format!("test -e {}", shell_quote(path));
+    let output = ssh_output(target, &command)?;
+    Ok(output.status.success())
+}
+
+fn confirm_remote_keybindings_copy(target: &str) -> io::Result<bool> {
+    if !io::stdin().is_terminal() {
+        return Ok(false);
+    }
+    eprintln!("remote Herdr config is not present on {target}.");
+    eprintln!(
+        "Herdr can copy your local [keys] settings so the remote server uses the same keybindings."
+    );
+    eprintln!("Custom command keybindings are not copied because they run on the remote host.");
+    eprint!("Copy local Herdr keybindings to {target}? [Y/n] ");
+    io::stderr().flush()?;
+
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    let answer = answer.trim().to_ascii_lowercase();
+    Ok(!(answer == "n" || answer == "no"))
+}
+
+fn upload_remote_config(target: &str, path: &str, content: &[u8]) -> io::Result<()> {
+    let script = format!(
+        r#"dest={}
+dir="${{dest%/*}}"
+mkdir -p "$dir"
+umask 077
+tmp="${{dest}}.tmp.$$"
+cat > "$tmp"
+mv "$tmp" "$dest"
+"#,
+        shell_quote(path)
+    );
+
+    let mut child = Command::new("ssh")
+        .arg("-T")
+        .arg(target)
+        .arg(format!("sh -eu -c {}", shell_quote(&script)))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!("failed to start ssh config upload: {err}"),
+            )
+        })?;
+
+    let copy_result = if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(content)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "ssh config upload stdin missing",
+        ))
+    };
+    let status = child.wait()?;
+    copy_result?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "remote config upload exited with {status}"
+        )))
+    }
 }
 
 fn install_remote_herdr(
@@ -927,6 +1356,43 @@ mod tests {
     }
 
     #[test]
+    fn local_keybindings_config_extracts_only_keys_without_commands() {
+        let toml = r#"
+[theme]
+name = "one-dark"
+
+[keys]
+prefix = "ctrl+a"
+new_tab = ["prefix+c", "ctrl+alt+n"]
+next_tab = "prefix+n"
+
+[keys.indexed]
+tabs = "ctrl"
+
+[[keys.command]]
+key = "prefix+g"
+type = "pane"
+command = "lazygit"
+"#;
+
+        let copied = local_keybindings_config_toml_from_str(toml).expect("copied key config");
+        assert!(copied.contains("[keys]"));
+        assert!(copied.contains("prefix = \"ctrl+a\""));
+        assert!(copied.contains("prefix+c"));
+        assert!(copied.contains("ctrl+alt+n"));
+        assert!(copied.contains("[keys.indexed]"));
+        assert!(copied.contains("tabs = \"ctrl\""));
+        assert!(!copied.contains("one-dark"));
+        assert!(!copied.contains("lazygit"));
+        assert!(!copied.contains("[[keys.command]]"));
+    }
+
+    #[test]
+    fn local_keybindings_config_returns_none_without_keys() {
+        assert!(local_keybindings_config_toml_from_str("[theme]\nname = \"one-dark\"\n").is_none());
+    }
+
+    #[test]
     fn remote_bridge_command_uses_installed_binary() {
         let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
             os: "linux",
@@ -935,6 +1401,167 @@ mod tests {
         assert_eq!(
             remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
             "exec \"$HOME/.local/bin/herdr\" remote-client-bridge"
+        );
+    }
+
+    #[test]
+    fn remote_path_probe_uses_path_binary_when_version_matches() {
+        let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        });
+        let stdout = matching_path_probe_stdout("/usr/bin/herdr");
+        let remote_herdr =
+            remote_herdr_from_path_probe(&remote_herdr, &stdout).expect("matching path binary");
+
+        assert_eq!(
+            remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
+            "exec /usr/bin/herdr remote-client-bridge"
+        );
+    }
+
+    #[test]
+    fn remote_path_probe_quotes_discovered_binary() {
+        let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        });
+        let stdout = matching_path_probe_stdout("/opt/herdr bin/herdr");
+        let remote_herdr =
+            remote_herdr_from_path_probe(&remote_herdr, &stdout).expect("matching path binary");
+
+        assert_eq!(
+            remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
+            "exec '/opt/herdr bin/herdr' remote-client-bridge"
+        );
+    }
+
+    #[test]
+    fn remote_path_probe_uses_macos_path_binary_when_version_matches() {
+        let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
+            os: "macos",
+            arch: "aarch64",
+        });
+        let stdout = matching_path_probe_stdout("/opt/homebrew/bin/herdr");
+        let remote_herdr =
+            remote_herdr_from_path_probe(&remote_herdr, &stdout).expect("matching path binary");
+
+        assert_eq!(
+            remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
+            "exec /opt/homebrew/bin/herdr remote-client-bridge"
+        );
+        assert_eq!(remote_herdr.platform.asset_key(), "macos-aarch64");
+    }
+
+    #[test]
+    fn remote_path_probe_quotes_single_quotes_in_discovered_binary() {
+        let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        });
+        let stdout = matching_path_probe_stdout("/opt/herdr's/bin/herdr");
+        let remote_herdr =
+            remote_herdr_from_path_probe(&remote_herdr, &stdout).expect("matching path binary");
+
+        assert_eq!(
+            remote_bridge_command(&remote_herdr, crate::session::DEFAULT_SESSION_NAME),
+            "exec '/opt/herdr'\\''s/bin/herdr' remote-client-bridge"
+        );
+    }
+
+    #[test]
+    fn remote_path_probe_ignores_version_mismatch() {
+        let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        });
+        let remote_herdr = remote_herdr_from_path_probe(
+            &remote_herdr,
+            &format!("/usr/bin/herdr\nherdr 0.0.0\nprotocol: {CURRENT_PROTOCOL}\n"),
+        );
+
+        assert!(remote_herdr.is_none());
+    }
+
+    #[test]
+    fn remote_path_probe_ignores_relative_paths() {
+        let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        });
+        let stdout = matching_path_probe_stdout("bin/herdr");
+        let remote_herdr = remote_herdr_from_path_probe(&remote_herdr, &stdout);
+
+        assert!(remote_herdr.is_none());
+    }
+
+    #[test]
+    fn remote_path_probe_ignores_protocol_mismatch() {
+        let remote_herdr = RemoteHerdr::for_platform(RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        });
+        let stdout = format!("/usr/bin/herdr\nherdr {CURRENT_VERSION}\nprotocol: 0\n");
+        let remote_herdr = remote_herdr_from_path_probe(&remote_herdr, &stdout);
+
+        assert!(remote_herdr.is_none());
+    }
+
+    #[test]
+    fn parse_status_protocol_reads_protocol_line() {
+        assert_eq!(
+            parse_status_protocol("version: x\nprotocol: 8\nbinary: y"),
+            Some(8)
+        );
+        assert_eq!(
+            parse_status_protocol("status: running\nprotocol: unknown"),
+            None
+        );
+        assert_eq!(parse_status_protocol("status: not running"), None);
+    }
+
+    #[test]
+    fn parse_status_version_reads_version_line() {
+        assert_eq!(
+            parse_status_version("status: running\nversion: 0.6.0\nprotocol: 8"),
+            Some("0.6.0")
+        );
+        assert_eq!(parse_status_version("status: not running"), None);
+    }
+
+    #[test]
+    fn remote_server_restart_reason_requires_stop_for_protocol_mismatch() {
+        assert_eq!(
+            remote_server_restart_reason(Some(CURRENT_VERSION), Some(0), false),
+            Some(RemoteServerRestartReason::ProtocolMismatch)
+        );
+    }
+
+    #[test]
+    fn remote_server_restart_reason_offers_restart_after_binary_update() {
+        assert_eq!(
+            remote_server_restart_reason(Some(CURRENT_VERSION), Some(CURRENT_PROTOCOL), true),
+            Some(RemoteServerRestartReason::BinaryUpdated)
+        );
+    }
+
+    #[test]
+    fn remote_server_restart_reason_offers_restart_for_version_mismatch() {
+        assert_eq!(
+            remote_server_restart_reason(Some("0.0.0"), Some(CURRENT_PROTOCOL), false),
+            Some(RemoteServerRestartReason::VersionMismatch)
+        );
+        assert_eq!(
+            remote_server_restart_reason(None, Some(CURRENT_PROTOCOL), false),
+            Some(RemoteServerRestartReason::VersionMismatch)
+        );
+    }
+
+    #[test]
+    fn remote_server_restart_reason_allows_current_server() {
+        assert_eq!(
+            remote_server_restart_reason(Some(CURRENT_VERSION), Some(CURRENT_PROTOCOL), false),
+            None
         );
     }
 
@@ -960,6 +1587,10 @@ mod tests {
             .expect("override source");
         assert_eq!(source.path, PathBuf::from("/tmp/herdr-aarch64"));
         assert!(source.temporary_dir.is_none());
+    }
+
+    fn matching_path_probe_stdout(path: &str) -> String {
+        format!("{path}\nherdr {CURRENT_VERSION}\nprotocol: {CURRENT_PROTOCOL}\n")
     }
 
     fn remote_env_lock() -> &'static std::sync::Mutex<()> {

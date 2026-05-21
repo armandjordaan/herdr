@@ -39,7 +39,7 @@ pub(crate) use self::{
         handle_keybind_help_key, handle_rename_key, handle_resize_key,
     },
     navigate::terminal_direct_navigation_action,
-    settings::open_settings,
+    settings::open_settings_at,
 };
 use self::{
     modal::{
@@ -58,23 +58,25 @@ impl App {
     pub(super) async fn handle_key(&mut self, key: TerminalKey) {
         match self.state.mode {
             Mode::Terminal => self.handle_terminal_key(key).await,
+            Mode::Prefix => self.handle_prefix_key(key),
             Mode::Navigate => self.handle_navigate_key(key),
             _ => {
-                let key = key.as_key_event();
+                let key_event = key.as_key_event();
                 match self.state.mode {
-                    Mode::Onboarding => self.handle_onboarding_key(key),
-                    Mode::ReleaseNotes => self.handle_release_notes_key(key),
-                    Mode::Navigate => unreachable!(),
+                    Mode::Onboarding => self.handle_onboarding_key(key_event),
+                    Mode::ReleaseNotes => self.handle_release_notes_key(key_event),
+                    Mode::ProductAnnouncement => self.handle_product_announcement_key(key_event),
+                    Mode::Prefix | Mode::Navigate => unreachable!(),
                     Mode::RenameWorkspace | Mode::RenameTab | Mode::RenamePane => {
-                        handle_rename_key(&mut self.state, key)
+                        handle_rename_key(&mut self.state, key_event)
                     }
                     Mode::Resize => handle_resize_key(&mut self.state, key),
-                    Mode::ConfirmClose => handle_confirm_close_key(&mut self.state, key),
-                    Mode::ContextMenu => handle_context_menu_key(&mut self.state, key),
-                    Mode::Settings => self.handle_settings_key(key),
-                    Mode::GlobalMenu => handle_global_menu_key(&mut self.state, key),
-                    Mode::KeybindHelp => handle_keybind_help_key(&mut self.state, key),
-                    Mode::Goto => handle_goto_key(&mut self.state, key),
+                    Mode::ConfirmClose => handle_confirm_close_key(&mut self.state, key_event),
+                    Mode::ContextMenu => handle_context_menu_key(&mut self.state, key_event),
+                    Mode::Settings => self.handle_settings_key(key_event),
+                    Mode::GlobalMenu => handle_global_menu_key(&mut self.state, key_event),
+                    Mode::KeybindHelp => handle_keybind_help_key(&mut self.state, key_event),
+                    Mode::Goto => handle_goto_key(&mut self.state, key_event),
                     Mode::Terminal => unreachable!(),
                 }
             }
@@ -131,6 +133,32 @@ impl App {
         }
     }
 
+    pub(crate) fn handle_product_announcement_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => self.scroll_product_announcement(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.scroll_product_announcement(1),
+            KeyCode::PageUp => self.scroll_product_announcement(-8),
+            KeyCode::PageDown => self.scroll_product_announcement(8),
+            KeyCode::Home => {
+                if let Some(announcement) = &mut self.state.product_announcement {
+                    announcement.scroll = 0;
+                }
+            }
+            KeyCode::End => {
+                let max_scroll = self.state.product_announcement_max_scroll();
+                if let Some(announcement) = &mut self.state.product_announcement {
+                    announcement.scroll = max_scroll;
+                }
+            }
+            _ => {
+                if let Some(ModalAction::Close) = modal_action_from_key(&key, RELEASE_NOTES_ACTIONS)
+                {
+                    self.dismiss_product_announcement();
+                }
+            }
+        }
+    }
+
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) {
         if self.handle_overlay_mouse(mouse) {
             return;
@@ -157,6 +185,7 @@ impl App {
         }
 
         let previous_agent_panel_scope = self.state.agent_panel_scope;
+        let previous_settings_section = self.state.settings.section;
         if let Some(action) = self.state.handle_mouse(mouse) {
             match action {
                 SettingsAction::SaveTheme(name) => self.save_theme(&name),
@@ -165,7 +194,15 @@ impl App {
                 SettingsAction::SaveAgentBorderLabels(enabled) => {
                     self.save_agent_border_labels(enabled)
                 }
+                SettingsAction::InstallRecommendedIntegrations => {
+                    self.install_recommended_integrations()
+                }
             }
+        }
+        if previous_settings_section != crate::app::state::SettingsSection::Integrations
+            && self.state.settings.section == crate::app::state::SettingsSection::Integrations
+        {
+            self.refresh_integration_recommendations();
         }
         if self.state.agent_panel_scope != previous_agent_panel_scope {
             self.save_agent_panel_scope(self.state.agent_panel_scope);
@@ -226,6 +263,7 @@ impl AppState {
                 cwd,
                 self.pane_scrollback_limit_bytes,
                 self.host_terminal_theme,
+                &self.default_shell,
             ) {
                 let new_id = new_pane.pane_id;
                 self.terminal_runtimes
@@ -261,7 +299,6 @@ fn app_for_mouse_test() -> App {
     let mut app = App::new(
         &crate::config::Config::default(),
         true,
-        None,
         None,
         api_rx,
         crate::api::EventHub::default(),

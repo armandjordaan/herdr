@@ -1,8 +1,9 @@
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Direction, Rect};
 
 use crate::{
-    app::state::{key_matches, AppState, ContextMenuKind, ContextMenuState, MenuListState, Mode},
+    app::state::{AppState, ContextMenuKind, ContextMenuState, MenuListState, Mode},
+    input::TerminalKey,
     layout::NavDirection,
 };
 
@@ -66,7 +67,7 @@ pub(super) fn modal_action_from_buttons<A: Copy>(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GlobalMenuAction {
-    Quit,
+    Detach,
     WhatsNew,
     Keybinds,
     ReloadConfig,
@@ -82,7 +83,7 @@ pub(super) fn global_menu_actions(state: &AppState) -> Vec<GlobalMenuAction> {
     if state.update_available.is_some() || state.latest_release_notes_available {
         actions.push(GlobalMenuAction::WhatsNew);
     }
-    actions.push(GlobalMenuAction::Quit);
+    actions.push(GlobalMenuAction::Detach);
     actions
 }
 
@@ -110,19 +111,19 @@ fn open_update_release_notes(state: &mut AppState) {
     state.mode = Mode::ReleaseNotes;
 }
 
-pub(super) fn request_quit_or_detach(state: &mut AppState) {
-    if state.quit_detaches {
-        state.detach_requested = true;
-    } else {
+pub(super) fn request_detach(state: &mut AppState) {
+    if state.detach_exits {
         state.should_quit = true;
+    } else {
+        state.detach_requested = true;
     }
 }
 
 pub(super) fn apply_global_menu_action(state: &mut AppState, action: GlobalMenuAction) {
     match action {
-        GlobalMenuAction::Quit => {
+        GlobalMenuAction::Detach => {
             leave_modal(state);
-            request_quit_or_detach(state);
+            request_detach(state);
         }
         GlobalMenuAction::WhatsNew => open_update_release_notes(state),
         GlobalMenuAction::Keybinds => open_keybind_help(state),
@@ -354,6 +355,67 @@ pub(super) fn apply_rename_action(state: &mut AppState, action: ModalAction) {
     }
 }
 
+fn clear_rename_input(state: &mut AppState) {
+    state.name_input.clear();
+    state.name_input_replace_on_type = false;
+}
+
+fn delete_rename_input_char(state: &mut AppState) {
+    if state.name_input_replace_on_type {
+        clear_rename_input(state);
+    } else {
+        state.name_input.pop();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenameWordDeleteClass {
+    Word,
+    Separator,
+}
+
+fn rename_word_delete_class(ch: char) -> RenameWordDeleteClass {
+    if ch.is_alphanumeric() || ch == '_' {
+        RenameWordDeleteClass::Word
+    } else {
+        RenameWordDeleteClass::Separator
+    }
+}
+
+fn delete_rename_input_word(state: &mut AppState) {
+    if state.name_input_replace_on_type {
+        clear_rename_input(state);
+        return;
+    }
+
+    while state
+        .name_input
+        .chars()
+        .last()
+        .is_some_and(char::is_whitespace)
+    {
+        state.name_input.pop();
+    }
+
+    let Some(class) = state
+        .name_input
+        .chars()
+        .last()
+        .map(rename_word_delete_class)
+    else {
+        return;
+    };
+
+    while state
+        .name_input
+        .chars()
+        .last()
+        .is_some_and(|ch| !ch.is_whitespace() && rename_word_delete_class(ch) == class)
+    {
+        state.name_input.pop();
+    }
+}
+
 pub(crate) fn handle_rename_key(state: &mut AppState, key: KeyEvent) {
     if let Some(action) = modal_action_from_key(&key, RENAME_ACTIONS) {
         apply_rename_action(state, action);
@@ -361,18 +423,25 @@ pub(crate) fn handle_rename_key(state: &mut AppState, key: KeyEvent) {
     }
 
     match key.code {
-        KeyCode::Backspace => {
-            if state.name_input_replace_on_type {
-                state.name_input.clear();
-                state.name_input_replace_on_type = false;
-            } else {
-                state.name_input.pop();
-            }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            clear_rename_input(state);
         }
-        KeyCode::Char(c) => {
+        KeyCode::Backspace if key.modifiers.contains(KeyModifiers::SUPER) => {
+            clear_rename_input(state);
+        }
+        KeyCode::Backspace
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                || key.modifiers.contains(KeyModifiers::ALT) =>
+        {
+            delete_rename_input_word(state);
+        }
+        KeyCode::Char('h' | 'w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            delete_rename_input_word(state);
+        }
+        KeyCode::Backspace => delete_rename_input_char(state),
+        KeyCode::Char(c) if key.modifiers.difference(KeyModifiers::SHIFT).is_empty() => {
             if state.name_input_replace_on_type {
-                state.name_input.clear();
-                state.name_input_replace_on_type = false;
+                clear_rename_input(state);
             }
             state.name_input.push(c);
         }
@@ -380,14 +449,12 @@ pub(crate) fn handle_rename_key(state: &mut AppState, key: KeyEvent) {
     }
 }
 
-pub(crate) fn handle_resize_key(state: &mut AppState, key: KeyEvent) {
+pub(crate) fn handle_resize_key(state: &mut AppState, raw_key: TerminalKey) {
+    let key = raw_key.as_key_event();
     if key.code == KeyCode::Esc
         || key.code == KeyCode::Enter
-        || key_matches(
-            &key,
-            state.keybinds.resize_mode.0,
-            state.keybinds.resize_mode.1,
-        )
+        || state.keybinds.resize_mode.matches_prefix_key(raw_key)
+        || state.keybinds.resize_mode.matches_direct_key(raw_key)
     {
         if state.active.is_some() {
             state.mode = Mode::Terminal;
@@ -559,19 +626,117 @@ mod tests {
     use super::super::{capture_snapshot, state_with_workspaces};
     use super::*;
 
+    fn config_env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    fn temp_config_path(name: &str) -> std::path::PathBuf {
+        let unique = format!(
+            "herdr-modal-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        std::env::temp_dir().join(unique).join("config.toml")
+    }
+
     #[test]
     fn custom_resize_key_exits_resize_mode() {
         let mut state = state_with_workspaces(&["test"]);
         state.mode = Mode::Resize;
-        state.keybinds.resize_mode = (KeyCode::Char('g'), KeyModifiers::empty());
-        state.keybinds.resize_mode_label = "g".into();
+        state.keybinds.resize_mode = crate::config::ActionKeybinds::prefix("g");
 
         handle_resize_key(
             &mut state,
-            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::empty()),
+            TerminalKey::new(KeyCode::Char('g'), KeyModifiers::empty()),
         );
 
         assert_eq!(state.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn direct_resize_key_exits_resize_mode() {
+        let mut state = state_with_workspaces(&["test"]);
+        state.mode = Mode::Resize;
+        state.keybinds.resize_mode = crate::config::ActionKeybinds::direct("ctrl+alt+r");
+
+        handle_resize_key(
+            &mut state,
+            TerminalKey::new(
+                KeyCode::Char('r'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+        );
+
+        assert_eq!(state.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn resize_key_exit_matches_enhanced_shifted_punctuation() {
+        let mut state = state_with_workspaces(&["test"]);
+        state.mode = Mode::Resize;
+        state.keybinds.resize_mode = crate::config::ActionKeybinds::prefix("?");
+
+        handle_resize_key(
+            &mut state,
+            TerminalKey::new(KeyCode::Char('/'), KeyModifiers::SHIFT)
+                .with_shifted_codepoint('?' as u32),
+        );
+
+        assert_eq!(state.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn detach_requests_client_detach_in_persistence_mode() {
+        let mut state = state_with_workspaces(&["test"]);
+        state.detach_exits = false;
+
+        request_detach(&mut state);
+
+        assert!(state.detach_requested);
+        assert!(!state.should_quit);
+    }
+
+    #[test]
+    fn detach_exits_in_no_session_mode() {
+        let mut state = state_with_workspaces(&["test"]);
+        state.detach_exits = true;
+
+        request_detach(&mut state);
+
+        assert!(state.should_quit);
+        assert!(!state.detach_requested);
+    }
+
+    #[test]
+    fn global_menu_whats_new_opens_saved_release_notes() {
+        let _guard = config_env_lock().lock().unwrap();
+        let path = temp_config_path("whats-new-saved-release-notes");
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+        crate::release_notes::save_pending(env!("CARGO_PKG_VERSION"), "### Changed\n- Menu")
+            .unwrap();
+
+        let mut state = state_with_workspaces(&["test"]);
+        state.latest_release_notes_available = true;
+
+        assert!(global_menu_actions(&state).contains(&GlobalMenuAction::WhatsNew));
+
+        apply_global_menu_action(&mut state, GlobalMenuAction::WhatsNew);
+
+        assert_eq!(state.mode, Mode::ReleaseNotes);
+        assert_eq!(
+            state
+                .release_notes
+                .as_ref()
+                .map(|notes| notes.body.as_str()),
+            Some("### Changed\n- Menu")
+        );
+
+        std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
@@ -661,6 +826,78 @@ mod tests {
             KeyEvent::new(KeyCode::Char('e'), KeyModifiers::empty()),
         );
         assert_eq!(state.name_input, "ne");
+    }
+
+    #[test]
+    fn rename_modal_handles_line_editing_shortcuts() {
+        let mut state = state_with_workspaces(&["test"]);
+        state.mode = Mode::RenameWorkspace;
+        state.name_input = "website zero".into();
+
+        handle_rename_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty()),
+        );
+        assert_eq!(state.name_input, "website zer");
+
+        handle_rename_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL),
+        );
+        assert_eq!(state.name_input, "website ");
+
+        state.name_input = "website-zero".into();
+        handle_rename_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT),
+        );
+        assert_eq!(state.name_input, "website-");
+
+        state.name_input = "website-zero".into();
+        handle_rename_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(state.name_input, "website-");
+
+        state.name_input = "website-zero".into();
+        handle_rename_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(state.name_input, "website-");
+
+        handle_rename_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::SUPER),
+        );
+        assert!(state.name_input.is_empty());
+
+        state.name_input = "website zero".into();
+        handle_rename_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        );
+        assert!(state.name_input.is_empty());
+    }
+
+    #[test]
+    fn rename_modal_does_not_insert_modified_shortcut_chars() {
+        let mut state = state_with_workspaces(&["test"]);
+        state.mode = Mode::RenameWorkspace;
+        state.name_input = "website".into();
+
+        handle_rename_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(state.name_input, "website");
+
+        handle_rename_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('Z'), KeyModifiers::SHIFT),
+        );
+        assert_eq!(state.name_input, "websiteZ");
     }
 
     #[test]

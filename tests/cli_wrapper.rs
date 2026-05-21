@@ -461,19 +461,13 @@ fn claude_hook_reports_subagent_working_and_blocked() {
 }
 
 #[test]
-fn claude_hook_converts_subagent_idle_and_release_to_working() {
+fn claude_hook_ignores_subagent_completion_reports() {
     let subagent_input =
         r#"{"hook_event_name":"SubagentStop","agent_id":"agent-abc123","agent_type":"Explore"}"#;
 
-    let idle = run_claude_hook("idle", subagent_input)
-        .expect("subagent idle should keep parent pane working");
-    assert_eq!(idle["method"], "pane.report_agent");
-    assert_eq!(idle["params"]["state"], "working");
-
-    let release = run_claude_hook("release", subagent_input)
-        .expect("subagent release should keep parent pane working");
-    assert_eq!(release["method"], "pane.report_agent");
-    assert_eq!(release["params"]["state"], "working");
+    assert!(run_claude_hook("working", subagent_input).is_none());
+    assert!(run_claude_hook("idle", subagent_input).is_none());
+    assert!(run_claude_hook("release", subagent_input).is_none());
 }
 
 #[test]
@@ -588,6 +582,44 @@ fn help_commands_exit_successfully() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+}
+
+#[test]
+fn root_help_hides_explicit_client_command() {
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr"))
+        .arg("--help")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("herdr client"),
+        "root help should not advertise the internal client command: {stdout}"
+    );
+}
+
+#[test]
+fn explicit_client_command_respects_nested_guard() {
+    let base = unique_test_dir();
+    fs::create_dir_all(&base).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr"))
+        .arg("client")
+        .env("HERDR_ENV", "1")
+        .env("XDG_CONFIG_HOME", &base)
+        .env_remove("HERDR_CONFIG_PATH")
+        .output()
+        .unwrap();
+
+    cleanup_test_base(&base);
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("nested herdr is disabled by default"),
+        "client should fail at the nested guard before connecting: {stderr}"
+    );
 }
 
 #[test]
@@ -936,7 +968,7 @@ fn status_commands_report_client_and_server_versions() {
         "stdout: {full_stdout}"
     );
     assert!(
-        full_stdout.contains("  protocol: 6"),
+        full_stdout.contains("  protocol: 8"),
         "stdout: {full_stdout}"
     );
     assert!(full_stdout.contains("server:\n"), "stdout: {full_stdout}");
@@ -969,7 +1001,7 @@ fn status_commands_report_client_and_server_versions() {
         "stdout: {server_stdout}"
     );
     assert!(
-        server_stdout.contains("protocol: 6"),
+        server_stdout.contains("protocol: 8"),
         "stdout: {server_stdout}"
     );
 
@@ -981,7 +1013,7 @@ fn status_commands_report_client_and_server_versions() {
         "stdout: {client_stdout}"
     );
     assert!(
-        client_stdout.contains("protocol: 6"),
+        client_stdout.contains("protocol: 8"),
         "stdout: {client_stdout}"
     );
     assert!(

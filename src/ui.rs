@@ -25,7 +25,7 @@ use self::goto::render_goto_overlay;
 use self::keybind_help::render_keybind_help_overlay;
 use self::menus::{
     render_context_menu, render_global_launcher_menu, render_navigate_overlay,
-    render_resize_overlay,
+    render_prefix_overlay, render_resize_overlay,
 };
 use self::mobile::{
     compute_mobile_header_hit_areas, is_mobile_width, mobile_switcher_max_scroll_for_height,
@@ -35,11 +35,12 @@ use self::mobile::{
 pub(crate) use self::onboarding::onboarding_welcome_continue_rect;
 use self::onboarding::render_onboarding_overlay;
 use self::panes::{compute_pane_infos, render_panes, resize_tab_panes};
-use self::release_notes::render_release_notes_overlay;
 pub(crate) use self::release_notes::{
-    release_notes_close_button_rect, release_notes_display_lines, release_notes_sections,
+    product_announcement_display_lines, release_notes_close_button_rect,
+    release_notes_display_lines, release_notes_sections, PRODUCT_ANNOUNCEMENT_MODAL_SIZE,
     RELEASE_NOTES_MODAL_SIZE,
 };
+use self::release_notes::{render_product_announcement_overlay, render_release_notes_overlay};
 pub(crate) use self::scrollbar::{
     pane_scrollbar_rect, release_notes_scrollbar_rect, scrollbar_offset_from_drag_row,
     scrollbar_offset_from_row, scrollbar_thumb_grab_offset, should_show_scrollbar,
@@ -50,7 +51,7 @@ use self::status::{render_config_diagnostic, render_toast_notification, toast_no
 use self::tabs::render_tab_bar;
 pub(crate) use self::{
     dialogs::{confirm_close_button_rects, confirm_close_popup_rect, rename_button_rects},
-    settings::settings_button_rects,
+    settings::{settings_button_rects, settings_show_primary_action},
     sidebar::{
         agent_panel_body_rect, agent_panel_entries, agent_panel_scroll_metrics,
         agent_panel_scrollbar_rect, agent_panel_toggle_rect, collapsed_sidebar_sections,
@@ -73,8 +74,6 @@ use crate::app::state::ViewLayout;
 use crate::app::{AppState, Mode};
 
 const COLLAPSED_WIDTH: u16 = 4; // num + space + dot + separator
-pub(crate) const MIN_SIDEBAR_WIDTH: u16 = 18;
-pub(crate) const MAX_SIDEBAR_WIDTH: u16 = 36;
 
 // Braille spinner frames — smooth rotation
 const SPINNERS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -149,7 +148,7 @@ fn compute_view_internal(
         COLLAPSED_WIDTH
     } else {
         app.sidebar_width
-            .clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH)
+            .clamp(app.sidebar_min_width, app.sidebar_max_width)
     };
 
     let [sidebar_area, main_area] =
@@ -309,10 +308,12 @@ pub fn render(app: &AppState, frame: &mut Frame) {
     match app.mode {
         Mode::Onboarding => render_onboarding_overlay(app, frame, frame.area()),
         Mode::ReleaseNotes => render_release_notes_overlay(app, frame, frame.area()),
+        Mode::ProductAnnouncement => render_product_announcement_overlay(app, frame, frame.area()),
         Mode::Navigate if app.view.layout == ViewLayout::Mobile => {
             render_mobile_panel(app, frame, frame.area())
         }
         Mode::Navigate => render_navigate_overlay(app, frame, terminal_area),
+        Mode::Prefix => render_prefix_overlay(app, frame, terminal_area),
         Mode::Resize => render_resize_overlay(app, frame, terminal_area),
         Mode::ConfirmClose => render_confirm_close_overlay(app, frame, terminal_area),
         Mode::ContextMenu => {
@@ -451,6 +452,36 @@ mod tests {
             app.view.mobile_menu_hit_area.x + app.view.mobile_menu_hit_area.width,
             44
         );
+    }
+
+    #[test]
+    fn compute_view_clamps_sidebar_width_to_configured_max() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        app.sidebar_max_width = 30;
+        app.sidebar_width = 999;
+
+        compute_view(&mut app, Rect::new(0, 0, 100, 20));
+
+        assert_eq!(app.view.sidebar_rect.width, 30);
+    }
+
+    #[test]
+    fn compute_view_clamps_sidebar_width_to_configured_min() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Terminal;
+        app.sidebar_min_width = 22;
+        app.sidebar_width = 5;
+
+        compute_view(&mut app, Rect::new(0, 0, 100, 20));
+
+        assert_eq!(app.view.sidebar_rect.width, 22);
     }
 
     #[test]
@@ -824,6 +855,22 @@ mod tests {
     }
 
     #[test]
+    fn release_notes_config_inline_code_uses_nonbreaking_spaces() {
+        let palette = Palette::catppuccin();
+        let lines = release_notes_lines("- After: `new_tab = \"prefix+c\"`", &palette);
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines[0].1.spans[2].content.as_ref(),
+            "new_tab\u{00a0}=\u{00a0}\"prefix+c\""
+        );
+        assert_eq!(
+            line_text(&lines[0].1).replace('\u{00a0}', " "),
+            " • After: new_tab = \"prefix+c\""
+        );
+    }
+
+    #[test]
     fn release_notes_preview_lines_show_update_steps() {
         let palette = Palette::catppuccin();
         let lines = release_notes_preview_lines("0.5.0", "herdr update", &palette);
@@ -869,6 +916,28 @@ mod tests {
     }
 
     #[test]
+    fn prefix_mode_renders_prefix_indicator() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.mode = Mode::Prefix;
+        app.view.terminal_area = ratatui::layout::Rect::new(0, 0, 60, 4);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 4))
+            .expect("test terminal");
+
+        terminal
+            .draw(|frame| render_prefix_overlay(&app, frame, app.view.terminal_area))
+            .expect("draw prefix overlay");
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("PREFIX"));
+    }
+
+    #[test]
     fn keybind_help_shows_unset_for_optional_actions() {
         let app = crate::app::state::AppState::test_new();
         let groups = keybind_help_groups(&app);
@@ -890,13 +959,19 @@ mod tests {
         assert!(workspace_tab.contains(&("unset".to_string(), "next workspace")));
         assert!(workspace_tab.contains(&("unset".to_string(), "previous agent")));
         assert!(workspace_tab.contains(&("unset".to_string(), "next agent")));
-        assert!(workspace_tab.contains(&("unset".to_string(), "rename tab")));
-        assert!(workspace_tab.contains(&("unset".to_string(), "previous tab")));
-        assert!(workspace_tab.contains(&("unset".to_string(), "next tab")));
-        assert!(workspace_tab.contains(&("unset".to_string(), "close tab")));
-        assert!(panes.contains(&("unset".to_string(), "focus pane left")));
-        assert!(panes.contains(&("unset".to_string(), "focus pane down")));
-        assert!(panes.contains(&("unset".to_string(), "focus pane up")));
-        assert!(panes.contains(&("unset".to_string(), "focus pane right")));
+        assert!(workspace_tab.contains(&("unset".to_string(), "focus agent 1-9")));
+        assert!(workspace_tab.contains(&("unset".to_string(), "switch workspace 1-9")));
+        assert!(panes
+            .iter()
+            .any(|(key, label)| key == "prefix+h" && *label == "focus pane left"));
+        assert!(panes
+            .iter()
+            .any(|(key, label)| key == "prefix+j" && *label == "focus pane down"));
+        assert!(panes
+            .iter()
+            .any(|(key, label)| key == "prefix+k" && *label == "focus pane up"));
+        assert!(panes
+            .iter()
+            .any(|(key, label)| key == "prefix+l" && *label == "focus pane right"));
     }
 }

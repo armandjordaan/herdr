@@ -4,7 +4,10 @@ use std::{
     process::{Command, Stdio},
 };
 
-use super::{ClipboardCommand, ForegroundJob, ForegroundProcess, Signal};
+use super::{
+    read_limited_reader, ClipboardCommand, ClipboardImage, ForegroundJob, ForegroundProcess,
+    LimitedRead, Signal,
+};
 
 /// Collect the foreground terminal job for a given child PID.
 pub fn foreground_job(child_pid: u32) -> Option<ForegroundJob> {
@@ -155,6 +158,34 @@ pub fn write_clipboard(bytes: &[u8]) -> bool {
     false
 }
 
+pub fn read_clipboard_image() -> Option<ClipboardImage> {
+    for (mime, extension) in [
+        ("image/png", "png"),
+        ("image/jpeg", "jpg"),
+        ("image/jpg", "jpg"),
+        ("image/gif", "gif"),
+        ("image/webp", "webp"),
+        ("image/bmp", "bmp"),
+    ] {
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            if let Some(bytes) = read_clipboard_image_with_command("wl-paste", &["--type", mime]) {
+                return Some(ClipboardImage { bytes, extension });
+            }
+        }
+
+        if std::env::var_os("DISPLAY").is_some() {
+            if let Some(bytes) = read_clipboard_image_with_command(
+                "xclip",
+                &["-selection", "clipboard", "-t", mime, "-o"],
+            ) {
+                return Some(ClipboardImage { bytes, extension });
+            }
+        }
+    }
+
+    None
+}
+
 /// Show a native desktop notification through libnotify's command-line helper.
 pub fn show_desktop_notification(title: &str, body: Option<&str>) -> std::io::Result<bool> {
     show_desktop_notification_with_command(title, body, |program| Command::new(program))
@@ -190,6 +221,57 @@ fn run_notification_command(mut command: Command) -> std::io::Result<bool> {
     };
 
     Ok(status.success())
+}
+
+fn read_clipboard_image_with_command(program: &str, args: &[&str]) -> Option<Vec<u8>> {
+    let mut command = Command::new(program);
+    command.args(args);
+    read_clipboard_image_with_spawned_command(command)
+}
+
+fn read_clipboard_image_with_spawned_command(command: Command) -> Option<Vec<u8>> {
+    read_clipboard_image_with_spawned_command_max(
+        command,
+        crate::server::protocol::MAX_CLIPBOARD_IMAGE_PAYLOAD,
+    )
+}
+
+fn read_clipboard_image_with_spawned_command_max(
+    mut command: Command,
+    max_bytes: usize,
+) -> Option<Vec<u8>> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let stdout = child.stdout.take()?;
+
+    let read = match read_limited_reader(stdout, max_bytes) {
+        Ok(read) => read,
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+    };
+
+    if read == LimitedRead::Oversized {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    }
+
+    let status = child.wait().ok()?;
+    if !status.success() {
+        return None;
+    }
+
+    match read {
+        LimitedRead::Complete(bytes) => Some(bytes),
+        LimitedRead::Empty | LimitedRead::Oversized => None,
+    }
 }
 
 fn clipboard_commands() -> Vec<ClipboardCommand> {
@@ -284,6 +366,28 @@ mod tests {
         assert_eq!(commands.len(), 2);
         assert_eq!(commands[0].program, "xclip");
         assert_eq!(commands[1].program, "xsel");
+    }
+
+    #[test]
+    fn read_clipboard_image_with_spawned_command_reads_under_limit() {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("printf image");
+
+        assert_eq!(
+            read_clipboard_image_with_spawned_command_max(command, 16),
+            Some(b"image".to_vec())
+        );
+    }
+
+    #[test]
+    fn read_clipboard_image_with_spawned_command_rejects_over_limit() {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("printf oversized");
+
+        assert_eq!(
+            read_clipboard_image_with_spawned_command_max(command, 4),
+            None
+        );
     }
 
     #[test]

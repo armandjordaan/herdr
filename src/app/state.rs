@@ -121,6 +121,28 @@ impl Palette {
         }
     }
 
+    /// Terminal 16-color theme.
+    pub fn terminal() -> Self {
+        Self {
+            accent: Color::Blue,
+            panel_bg: Color::Reset,
+            surface0: Color::Reset,
+            surface1: Color::DarkGray,
+            surface_dim: Color::DarkGray,
+            overlay0: Color::Gray,
+            overlay1: Color::White,
+            text: Color::Reset,
+            subtext0: Color::Gray,
+            mauve: Color::Gray,
+            green: Color::Green,
+            yellow: Color::Yellow,
+            red: Color::LightRed,
+            blue: Color::Blue,
+            teal: Color::Cyan,
+            peach: Color::Yellow,
+        }
+    }
+
     /// Tokyo Night — blue-purple aesthetic.
     pub fn tokyo_night() -> Self {
         Self {
@@ -456,6 +478,7 @@ impl Palette {
         match name.to_lowercase().replace([' ', '_'], "-").as_str() {
             "catppuccin" | "catppuccin-mocha" => Some(Self::catppuccin()),
             "catppuccin-latte" | "latte" | "light" => Some(Self::catppuccin_latte()),
+            "terminal" => Some(Self::terminal()),
             "tokyo-night" | "tokyonight" => Some(Self::tokyo_night()),
             "tokyo-night-day" | "tokyo-day" | "tokyonight-day" => Some(Self::tokyo_night_day()),
             "dracula" => Some(Self::dracula()),
@@ -565,7 +588,9 @@ pub struct ViewState {
 pub enum Mode {
     Onboarding,
     ReleaseNotes,
+    ProductAnnouncement,
     Navigate,
+    Prefix,
     Terminal,
     RenameWorkspace,
     RenameTab,
@@ -628,10 +653,17 @@ pub enum SettingsSection {
     Sound,
     Toast,
     PaneLabels,
+    Integrations,
 }
 
 impl SettingsSection {
-    pub const ALL: &[Self] = &[Self::Theme, Self::Sound, Self::Toast, Self::PaneLabels];
+    pub const ALL: &[Self] = &[
+        Self::Theme,
+        Self::Sound,
+        Self::Toast,
+        Self::PaneLabels,
+        Self::Integrations,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -639,6 +671,7 @@ impl SettingsSection {
             Self::Sound => "sound",
             Self::Toast => "toasts",
             Self::PaneLabels => "pane labels",
+            Self::Integrations => "integrations",
         }
     }
 }
@@ -647,6 +680,7 @@ impl SettingsSection {
 pub const THEME_NAMES: &[&str] = &[
     "catppuccin",
     "catppuccin-latte",
+    "terminal",
     "tokyo-night",
     "tokyo-night-day",
     "dracula",
@@ -755,6 +789,9 @@ pub(crate) enum DragTarget {
     ReleaseNotesScrollbar {
         grab_row_offset: u16,
     },
+    ProductAnnouncementScrollbar {
+        grab_row_offset: u16,
+    },
     KeybindHelpScrollbar {
         grab_row_offset: u16,
     },
@@ -861,6 +898,15 @@ pub struct ReleaseNotesState {
     pub preview: bool,
 }
 
+pub struct ProductAnnouncementState {
+    pub version: String,
+    pub id: String,
+    pub title: String,
+    pub body: String,
+    pub scroll: u16,
+    pub preview: bool,
+}
+
 pub struct KeybindHelpState {
     pub scroll: u16,
 }
@@ -886,8 +932,8 @@ pub struct AppState {
     pub selected: usize,
     pub mode: Mode,
     pub should_quit: bool,
-    /// In persistence mode, client quit actions detach instead of stopping the server.
-    pub quit_detaches: bool,
+    /// In monolithic --no-session mode, detach exits the app because there is no server to detach from.
+    pub detach_exits: bool,
     /// Set when the current client should detach from the persistent session.
     /// The server's event loop checks this and handles client detach.
     pub detach_requested: bool,
@@ -907,6 +953,7 @@ pub struct AppState {
     pub name_input: String,
     pub name_input_replace_on_type: bool,
     pub release_notes: Option<ReleaseNotesState>,
+    pub product_announcement: Option<ProductAnnouncementState>,
     pub keybind_help: KeybindHelpState,
     pub workspace_scroll: usize,
     pub agent_panel_scroll: usize,
@@ -936,6 +983,8 @@ pub struct AppState {
     pub prefix_mods: KeyModifiers,
     pub default_sidebar_width: u16,
     pub sidebar_width: u16,
+    pub sidebar_min_width: u16,
+    pub sidebar_max_width: u16,
     pub sidebar_width_source: SidebarWidthSource,
     pub sidebar_width_auto: bool,
     pub sidebar_collapsed: bool,
@@ -948,7 +997,17 @@ pub struct AppState {
     pub confirm_close: bool,
     pub prompt_new_tab_name: bool,
     pub show_agent_labels_on_pane_borders: bool,
+    /// Expose the focused pane's cursor anchor to the outer terminal even when
+    /// the pane requested `?25l`. See `[experimental] reveal_hidden_cursor_for_cjk_ime`.
+    pub reveal_hidden_cursor_for_cjk_ime: bool,
+    /// Restrict cursor reveal to focused panes whose detected agent matches
+    /// one of these. When false, apply to any focused pane.
+    pub cjk_ime_agent_filter_configured: bool,
+    pub cjk_ime_agents: Vec<crate::detect::Agent>,
+    /// DECSCUSR shape parameter (1–6) for the IME anchor cursor.
+    pub cjk_ime_cursor_shape: u8,
     pub kitty_graphics_enabled: bool,
+    pub default_shell: String,
     pub pane_scrollback_limit_bytes: usize,
     #[allow(dead_code)] // kept for backward compat; palette.accent is the source of truth
     pub accent: Color,
@@ -964,6 +1023,10 @@ pub struct AppState {
     pub theme_name: String,
     /// Settings panel state.
     pub settings: SettingsState,
+    /// Cached integration recommendations for onboarding/settings UI.
+    pub integration_recommendations: Vec<crate::integration::IntegrationRecommendation>,
+    /// Result messages from the latest integration install action.
+    pub integration_install_messages: Vec<String>,
     /// Highlight state for the bottom-right global launcher menu.
     pub global_menu: MenuListState,
     /// Picker state for the `goto` overlay.
@@ -991,6 +1054,25 @@ impl AppState {
         self.show_agent_labels_on_pane_borders
     }
 
+    pub(crate) fn integration_updates_available(&self) -> bool {
+        self.integration_recommendations
+            .iter()
+            .any(|item| item.state == crate::integration::IntegrationStatusKind::Outdated)
+    }
+
+    pub(crate) fn global_menu_attention_badge_visible(&self) -> bool {
+        self.update_available.is_some() || self.integration_updates_available()
+    }
+
+    pub(crate) fn global_menu_item_has_badge(&self, item: &str) -> bool {
+        (item == "update ready" && self.update_available.is_some())
+            || (item == "settings" && self.integration_updates_available())
+    }
+
+    pub(crate) fn settings_section_has_badge(&self, section: SettingsSection) -> bool {
+        section == SettingsSection::Integrations && self.integration_updates_available()
+    }
+
     pub fn focused_pane_requests_mouse_capture(&self) -> bool {
         self.mode == Mode::Terminal
             && self
@@ -1004,8 +1086,8 @@ impl AppState {
         self.mouse_capture || self.focused_pane_requests_mouse_capture()
     }
 
-    pub fn is_prefix(&self, key: &crossterm::event::KeyEvent) -> bool {
-        key_matches(key, self.prefix_code, self.prefix_mods)
+    pub fn is_prefix_key(&self, key: crate::input::TerminalKey) -> bool {
+        crate::config::terminal_key_matches_combo(key, (self.prefix_code, self.prefix_mods))
     }
 
     pub fn estimate_pane_size(&self) -> (u16, u16) {
@@ -1091,23 +1173,16 @@ impl AppState {
     }
 }
 
+#[cfg(test)]
 pub fn key_matches(
     key: &crossterm::event::KeyEvent,
     expected_code: KeyCode,
     expected_mods: KeyModifiers,
 ) -> bool {
-    if key.modifiers != expected_mods {
-        return false;
-    }
-
-    match (key.code, expected_code) {
-        (KeyCode::Char(actual), KeyCode::Char(expected))
-            if actual.is_ascii_alphabetic() && expected.is_ascii_alphabetic() =>
-        {
-            actual.eq_ignore_ascii_case(&expected)
-        }
-        (actual, expected) => actual == expected,
-    }
+    crate::config::terminal_key_matches_combo(
+        crate::input::TerminalKey::from(*key),
+        (expected_code, expected_mods),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1127,7 +1202,7 @@ impl AppState {
             selected: 0,
             mode: Mode::Navigate,
             should_quit: false,
-            quit_detaches: false,
+            detach_exits: false,
             detach_requested: false,
             request_new_workspace: false,
             request_new_tab: false,
@@ -1141,6 +1216,7 @@ impl AppState {
             name_input: String::new(),
             name_input_replace_on_type: false,
             release_notes: None,
+            product_announcement: None,
             keybind_help: KeybindHelpState { scroll: 0 },
             workspace_scroll: 0,
             agent_panel_scroll: 0,
@@ -1180,6 +1256,8 @@ impl AppState {
             prefix_mods: KeyModifiers::CONTROL,
             default_sidebar_width: 26,
             sidebar_width: 26,
+            sidebar_min_width: 18,
+            sidebar_max_width: 36,
             sidebar_width_source: SidebarWidthSource::ConfigDefault,
             sidebar_width_auto: false,
             sidebar_collapsed: false,
@@ -1189,7 +1267,12 @@ impl AppState {
             confirm_close: true,
             prompt_new_tab_name: true,
             show_agent_labels_on_pane_borders: false,
+            reveal_hidden_cursor_for_cjk_ime: false,
+            cjk_ime_agent_filter_configured: false,
+            cjk_ime_agents: Vec::new(),
+            cjk_ime_cursor_shape: 2, // steady_block
             kitty_graphics_enabled: false,
+            default_shell: String::new(),
             pane_scrollback_limit_bytes: crate::config::DEFAULT_SCROLLBACK_LIMIT_BYTES,
             accent: Color::Cyan,
             sound: SoundConfig {
@@ -1198,71 +1281,7 @@ impl AppState {
             },
             local_sound_playback: false,
             toast_config: ToastConfig::default(),
-            keybinds: Keybinds {
-                new_workspace: (KeyCode::Char('n'), KeyModifiers::empty()),
-                new_workspace_label: "n".into(),
-                rename_workspace: (KeyCode::Char('n'), KeyModifiers::SHIFT),
-                rename_workspace_label: "shift+n".into(),
-                close_workspace: (KeyCode::Char('d'), KeyModifiers::SHIFT),
-                close_workspace_label: "shift+d".into(),
-                detach: None,
-                detach_label: None,
-                reload_config: None,
-                reload_config_label: None,
-                open_notification_target: None,
-                open_notification_target_label: None,
-                previous_workspace: None,
-                previous_workspace_label: None,
-                next_workspace: None,
-                next_workspace_label: None,
-                previous_agent: None,
-                previous_agent_label: None,
-                next_agent: None,
-                next_agent_label: None,
-                indexed_tabs: None,
-                indexed_tabs_label: None,
-                indexed_workspaces: None,
-                indexed_workspaces_label: None,
-                indexed_agents: None,
-                indexed_agents_label: None,
-                new_tab: (KeyCode::Char('c'), KeyModifiers::empty()),
-                new_tab_label: "c".into(),
-                rename_tab: None,
-                rename_tab_label: None,
-                previous_tab: None,
-                previous_tab_label: None,
-                next_tab: None,
-                next_tab_label: None,
-                close_tab: None,
-                close_tab_label: None,
-                rename_pane: None,
-                rename_pane_label: None,
-                edit_scrollback: None,
-                edit_scrollback_label: None,
-                focus_pane_left: None,
-                focus_pane_left_label: None,
-                focus_pane_down: None,
-                focus_pane_down_label: None,
-                focus_pane_up: None,
-                focus_pane_up_label: None,
-                focus_pane_right: None,
-                focus_pane_right_label: None,
-                split_vertical: (KeyCode::Char('v'), KeyModifiers::empty()),
-                split_vertical_label: "v".into(),
-                split_horizontal: (KeyCode::Char('-'), KeyModifiers::empty()),
-                split_horizontal_label: "-".into(),
-                close_pane: (KeyCode::Char('x'), KeyModifiers::empty()),
-                close_pane_label: "x".into(),
-                zoom: (KeyCode::Char('f'), KeyModifiers::empty()),
-                zoom_label: "f".into(),
-                resize_mode: (KeyCode::Char('r'), KeyModifiers::empty()),
-                resize_mode_label: "r".into(),
-                toggle_sidebar: (KeyCode::Char('b'), KeyModifiers::empty()),
-                toggle_sidebar_label: "b".into(),
-                goto: (KeyCode::Char('g'), KeyModifiers::empty()),
-                goto_label: "g".into(),
-                custom_commands: Vec::new(),
-            },
+            keybinds: Keybinds::default(),
             spinner_tick: 0,
             palette: Palette::catppuccin(),
             theme_name: "catppuccin".to_string(),
@@ -1272,6 +1291,8 @@ impl AppState {
                 original_palette: None,
                 original_theme: None,
             },
+            integration_recommendations: Vec::new(),
+            integration_install_messages: Vec::new(),
             global_menu: MenuListState::new(0),
             goto: GotoState::default(),
             host_terminal_theme: TerminalTheme::default(),

@@ -78,6 +78,7 @@ fn agent_panel_current_workspace_idx(app: &AppState) -> Option<usize> {
             | Mode::Settings
             | Mode::GlobalMenu
             | Mode::KeybindHelp
+            | Mode::ProductAnnouncement
     ) {
         Some(app.selected)
     } else {
@@ -725,18 +726,18 @@ fn render_workspace_list(app: &AppState, frame: &mut Frame, area: Rect, is_navig
     if app.mouse_capture && list_bottom > area.y {
         let new_rect = app.sidebar_new_button_rect();
         frame.render_widget(
-            Paragraph::new(Span::styled("new", Style::default().fg(p.overlay0))),
+            Paragraph::new(Span::styled(" new", Style::default().fg(p.overlay0))),
             new_rect,
         );
 
         let menu_rect = app.global_launcher_rect();
-        let menu_line = if app.update_available.is_some() {
+        let menu_line = if app.global_menu_attention_badge_visible() {
             Line::from(vec![
-                Span::styled("menu", Style::default().fg(p.overlay0)),
                 Span::styled(
-                    " ●",
+                    "● ",
                     Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
                 ),
+                Span::styled("menu", Style::default().fg(p.overlay0)),
             ])
         } else {
             Line::from(vec![Span::styled("menu", Style::default().fg(p.overlay0))])
@@ -886,7 +887,7 @@ fn render_sidebar_toggle(
     if toggle_area == Rect::default() {
         return;
     }
-    let icon_style = if app.update_available.is_some() {
+    let icon_style = if app.global_menu_attention_badge_visible() {
         Style::default().fg(p.accent).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(p.overlay0)
@@ -935,6 +936,34 @@ mod tests {
         assert_eq!(entries[1].primary_label, "two");
         assert_eq!(entries[1].primary_tab_label.as_deref(), Some("logs"));
         assert_eq!(entries[1].agent_label.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn all_workspaces_agent_panel_entries_prefer_agent_names_for_agent_identity() {
+        let mut app = crate::app::state::AppState::test_new();
+        let workspace = Workspace::test_new("bridge");
+        let first_pane = workspace.tabs[0].root_pane;
+
+        app.workspaces = vec![workspace];
+        app.ensure_test_terminals();
+        let first_terminal_id = app.workspaces[0].tabs[0].panes[&first_pane]
+            .attached_terminal_id
+            .clone();
+        app.terminals
+            .get_mut(&first_terminal_id)
+            .unwrap()
+            .detected_agent = Some(Agent::Pi);
+        app.terminals
+            .get_mut(&first_terminal_id)
+            .unwrap()
+            .set_agent_name("planner".into());
+        app.active = Some(0);
+        app.selected = 0;
+        app.agent_panel_scope = AgentPanelScope::AllWorkspaces;
+
+        let entries = agent_panel_entries(&app);
+        assert_eq!(entries[0].primary_label, "bridge");
+        assert_eq!(entries[0].agent_label.as_deref(), Some("planner"));
     }
 
     #[test]

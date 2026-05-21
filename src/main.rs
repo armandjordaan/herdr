@@ -35,6 +35,7 @@ mod logging;
 mod pane;
 mod persist;
 mod platform;
+mod product_announcements;
 mod raw_input;
 mod release_notes;
 mod remote;
@@ -61,8 +62,9 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # onboarding = true
 
 [theme]
-# Built-in themes: catppuccin, tokyo-night, dracula, nord, gruvbox,
-#                  one-dark, solarized, kanagawa, rose-pine, vesper
+# Built-in themes: catppuccin, terminal, tokyo-night, dracula, nord,
+#                  gruvbox, one-dark, solarized, kanagawa, rose-pine,
+#                  vesper
 # name = "catppuccin"
 
 # Override individual color tokens on top of the base theme.
@@ -73,61 +75,83 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # red = "#ff6188"
 # green = "#a6e3a1"
 
+[terminal]
+# Executable used for new interactive panes.
+# Empty means $SHELL, then /bin/sh.
+# default_shell = ""
+
 [keys]
-# Prefix key to enter navigate mode (default: "ctrl+b")
+# Prefix key to enter prefix mode (default: "ctrl+b")
 # Examples: "ctrl+b", "f12", "esc", "-"
-# Accepted syntax: plain keys, ctrl/shift/alt/cmd/super modifiers, and special keys like enter/tab/esc/left/right/up/down
-# Most reliable bindings are plain keys, ctrl+letter, esc/tab/enter, and function keys.
+# Action bindings use explicit syntax: "prefix+n" requires the prefix;
+# "ctrl+alt+n" is a direct terminal-mode shortcut.
+# Accepted key syntax: plain keys, ctrl/shift/alt/cmd/super modifiers, and special keys like enter/tab/esc/left/right/up/down.
+# Named punctuation such as minus, comma, ampersand, plus, and backtick is also accepted.
+# Most reliable direct bindings are ctrl+letter, function keys, and explicit modified chords.
 # alt+..., cmd/super, and punctuation-with-modifiers may depend on your terminal/tmux setup.
 # prefix = "ctrl+b"
 
-# Navigate-mode actions
-# new_workspace = "n"
-# rename_workspace = "shift+n"
-# close_workspace = "shift+d"
+# Prefix-mode actions
+# help = "prefix+?"
+# settings = "prefix+s"
+# detach = "prefix+q"
+# reload_config = "prefix+shift+r"
+# open_notification_target = "prefix+o"
+# workspace_picker = "prefix+w"
+# new_workspace = "prefix+shift+n"
+# rename_workspace = "prefix+shift+w"
+# close_workspace = "prefix+shift+d"
 # previous_workspace = "" # optional, unset by default
 # next_workspace = ""     # optional, unset by default
 # previous_agent = ""     # optional, unset by default
 # next_agent = ""         # optional, unset by default
-# detach = ""             # optional explicit detach shortcut in server/client mode
-# reload_config = ""      # optional shortcut to reload config.toml without restarting
-# open_notification_target = "" # optional shortcut to jump to the visible notification target
-# new_tab = "c"
-# rename_tab = ""         # optional, unset by default
-# previous_tab = ""       # optional, unset by default
-# next_tab = ""           # optional, unset by default
-# close_tab = ""          # optional, unset by default
-# rename_pane = ""        # optional, unset by default
-# edit_scrollback = ""    # optional, opens focused pane scrollback in $EDITOR
-# focus_pane_left = ""    # optional, unset by default
-# focus_pane_down = ""    # optional, unset by default
-# focus_pane_up = ""      # optional, unset by default
-# focus_pane_right = ""   # optional, unset by default
-# split_vertical = "v"
-# split_horizontal = "-"
-# close_pane = "x"
-# zoom = "f"             # legacy alias: fullscreen
-# resize_mode = "r"
-# toggle_sidebar = "b"
+# focus_agent = ""        # optional indexed binding, e.g. "prefix+alt+1..9"
+# new_tab = "prefix+c"
+# rename_tab = "prefix+shift+t"
+# previous_tab = "prefix+p"
+# next_tab = "prefix+n"
+# switch_tab = "prefix+1..9"
+# switch_workspace = ""   # optional indexed binding, e.g. "prefix+shift+1..9"
+# close_tab = "prefix+shift+x"
+# rename_pane = "prefix+shift+p"
+# edit_scrollback = "prefix+e"
+# focus_pane_left = "prefix+h"
+# focus_pane_down = "prefix+j"
+# focus_pane_up = "prefix+k"
+# focus_pane_right = "prefix+l"
+# cycle_pane_next = "prefix+tab"
+# cycle_pane_previous = "prefix+shift+tab"
+# split_vertical = "prefix+v"
+# split_horizontal = "prefix+minus"
+# close_pane = "prefix+x"
+# zoom = "prefix+z"       # legacy alias: fullscreen
+# resize_mode = "prefix+r"
+# toggle_sidebar = "prefix+b"
 
-# Custom prefix-mode commands. Press prefix, then the configured key.
+# Custom commands use the same binding syntax.
 # type = "shell" runs detached in the background.
 # type = "pane" opens a temporary pane and closes it when the command exits.
 # [[keys.command]]
-# key = "g"
+# key = "prefix+g"
 # type = "pane"
 # command = "lazygit"
 
-# Optional modifier-only shortcuts expanded over number keys 1-9.
-# Empty means disabled. Examples: "ctrl", "ctrl+shift", "alt".
+# Legacy indexed shortcut config is still parsed for compatibility.
+# Prefer switch_tab, switch_workspace, and focus_agent for new configs.
 # [keys.indexed]
-# tabs = ""       # e.g. "ctrl" makes ctrl+1..9 switch tabs
-# workspaces = "" # e.g. "ctrl+shift" makes ctrl+shift+1..9 switch workspaces
-# agents = ""     # e.g. "alt" makes alt+1..9 focus agent rows
+# tabs = ""       # e.g. "ctrl" makes ctrl+1..9 switch tabs directly
+# workspaces = "" # e.g. "ctrl+shift" makes ctrl+shift+1..9 switch workspaces directly
+# agents = ""     # e.g. "alt" makes alt+1..9 focus agent rows directly
 
 [ui]
 # Sidebar width (auto-scaled based on workspace names, this sets the default)
 # sidebar_width = 26
+
+# Minimum sidebar width when expanded (columns)
+# sidebar_min_width = 18
+
+# Maximum sidebar width when expanded (columns)
+# sidebar_max_width = 36
 
 # Capture mouse input for Herdr's mouse UI.
 # Set false to let the terminal handle normal clicks, such as Cmd-clicking URLs.
@@ -178,6 +202,20 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Experimental local Kitty graphics rendering for attached clients.
 # Requires a Kitty graphics-compatible outer terminal.
 # kitty_graphics = false
+# Expose the focused pane's cursor to the outer terminal so macOS input
+# methods keep tracking the candidate window when TUIs paint their own
+# cursor (Claude Code, pi, codex). Trade-off: extra cursor visible for
+# apps that hide it without painting a replacement (vim normal mode, etc.).
+# reveal_hidden_cursor_for_cjk_ime = false
+# Optional allow-list: only reveal for focused panes whose detected agent
+# matches one of these names. Empty means apply to any focused pane.
+# If the list contains no valid names, the reveal does not apply.
+# Accepted: pi, claude, codex, gemini, cursor, cline, opencode, copilot,
+# kimi, kiro, droid, amp, grok, hermes.
+# cjk_ime_agents = []
+# Cursor shape rendered when reveal_hidden_cursor_for_cjk_ime is true.
+# Values: block, steady_block (default), underline, steady_underline, bar, steady_bar.
+# cjk_ime_cursor_shape = "steady_block"
 
 [advanced]
 # Maximum scrollback buffer size in bytes retained per pane terminal.
@@ -202,6 +240,16 @@ fn random_nested_message() -> &'static str {
         .unwrap_or(0);
     let index = (nanos ^ (std::process::id() as usize)) % NESTED_HERDR_MESSAGES.len();
     NESTED_HERDR_MESSAGES[index]
+}
+
+fn exit_if_nested_disabled(config: &config::Config) {
+    if should_block_nested(config) {
+        eprintln!("\x1b[1merror:\x1b[0m nested herdr is disabled by default.");
+        eprintln!("see configuration if you want to enable it.");
+        eprintln!();
+        eprintln!("\x1b[2m\"{}\"\x1b[0m", random_nested_message());
+        std::process::exit(1);
+    }
 }
 
 fn main() -> io::Result<()> {
@@ -250,8 +298,10 @@ fn main() -> io::Result<()> {
         return server::headless::run_server();
     }
 
-    // Client mode: connect to an existing server's client socket.
+    // Hidden client mode: connect to an existing server's client socket.
     if args.get(1).map(|s| s.as_str()) == Some("client") {
+        let loaded_config = config::Config::load();
+        exit_if_nested_disabled(&loaded_config.config);
         return client::run_client();
     }
 
@@ -279,6 +329,7 @@ fn main() -> io::Result<()> {
         println!("       herdr update");
         println!("       herdr server stop");
         println!("       herdr server reload-config");
+        println!("       herdr config <subcommand> ...");
         println!("       herdr workspace <subcommand> ...");
         println!("       herdr tab <subcommand> ...");
         println!("       herdr agent <subcommand> ...");
@@ -302,6 +353,10 @@ fn main() -> io::Result<()> {
             (
                 "herdr server reload-config",
                 "Reload config.toml in the running server",
+            ),
+            (
+                "herdr config reset-keys",
+                "Back up config.toml and remove custom keybindings",
             ),
             (
                 "herdr workspace <subcommand>",
@@ -333,15 +388,7 @@ fn main() -> io::Result<()> {
         }
         println!();
         println!("Advanced commands:");
-        for (command, description) in [
-            ("herdr server", "Run as headless server"),
-            (
-                "herdr client",
-                "Connect to a running server as a thin client",
-            ),
-        ] {
-            println!("  {command:<32} {description}");
-        }
+        println!("  {:<32} Run as headless server", "herdr server");
         println!();
         println!("Options:");
         println!("  --no-session        Run monolithically (no server/client, escape hatch)");
@@ -392,6 +439,7 @@ fn main() -> io::Result<()> {
                 "remote-client-bridge",
                 "update",
                 "status",
+                "config",
                 "workspace",
                 "pane",
                 "wait",
@@ -411,13 +459,7 @@ fn main() -> io::Result<()> {
     }
 
     let loaded_config = config::Config::load();
-    if should_block_nested(&loaded_config.config) {
-        eprintln!("\x1b[1merror:\x1b[0m nested herdr is disabled by default.");
-        eprintln!("see configuration if you want to enable it.");
-        eprintln!();
-        eprintln!("\x1b[2m\"{}\"\x1b[0m", random_nested_message());
-        std::process::exit(1);
-    }
+    exit_if_nested_disabled(&loaded_config.config);
 
     let no_session = args.iter().any(|a| a == "--no-session");
 
@@ -448,13 +490,17 @@ fn main() -> io::Result<()> {
         Err(err) => return Err(err),
     };
 
-    let in_tmux = std::env::var("TMUX").is_ok();
+    let modify_other_keys_mode = crate::input::host_modify_other_keys_mode(
+        std::env::var("TMUX").is_ok(),
+        std::env::var("TERM_PROGRAM").ok().as_deref(),
+        std::env::var_os("WEZTERM_PANE").is_some(),
+    );
 
     let original_hook = std::panic::take_hook();
-    let panic_in_tmux = in_tmux;
+    let panic_resets_modify_other_keys = modify_other_keys_mode.is_some();
     std::panic::set_hook(Box::new(move |info| {
         tracing::error!("PANIC: {info}");
-        if panic_in_tmux {
+        if panic_resets_modify_other_keys {
             let _ = std::io::Write::write_all(&mut io::stdout(), b"\x1b[>4;0m");
         }
         if crate::kitty_graphics::is_enabled() {
@@ -498,29 +544,26 @@ fn main() -> io::Result<()> {
             PushKeyboardEnhancementFlags(crate::input::ime_compatible_keyboard_enhancement_flags())
         )?;
 
-        // tmux doesn't understand kitty keyboard protocol push (\e[>1u).
-        // It uses modifyOtherKeys mode to send CSI u sequences for modified keys.
-        // Enable modifyOtherKeys mode 2 so tmux sends Shift+Enter as \e[13;2u etc.
-        if in_tmux {
+        // Some hosts do not honor Kitty keyboard enhancement pushes for
+        // Shift+Enter. Enable xterm modifyOtherKeys only on hosts where we
+        // know it is needed and parseable, so modified Enter stays distinct.
+        if let Some(mode) = modify_other_keys_mode {
             use std::io::Write;
-            std::io::stdout().write_all(b"\x1b[>4;2m")?;
+            std::io::stdout().write_all(mode.set_sequence())?;
             std::io::stdout().flush()?;
         }
-
-        let startup_release_notes = crate::release_notes::load_pending_for_current_version();
 
         let mut app = app::App::new(
             config,
             true, // no_session — monolithic mode never saves/restores sessions
             config_diagnostic,
-            startup_release_notes,
             api_rx,
             event_hub,
         );
         let result = app.run(&mut terminal).await;
 
-        // Reset modifyOtherKeys if we enabled it
-        if in_tmux {
+        // Reset modifyOtherKeys if we enabled it.
+        if modify_other_keys_mode.is_some() {
             use std::io::Write;
             std::io::stdout().write_all(b"\x1b[>4;0m")?;
             std::io::stdout().flush()?;

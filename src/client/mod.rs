@@ -32,8 +32,8 @@ use tracing::{debug, info, warn};
 
 use crate::server::headless::client_socket_path;
 use crate::server::protocol::{
-    self, ClientMessage, NotifyKind, RenderEncoding, ServerMessage, MAX_FRAME_SIZE,
-    MAX_GRAPHICS_FRAME_SIZE, PROTOCOL_VERSION,
+    self, ClientMessage, NotifyKind, RenderEncoding, ServerMessage, MAX_CLIPBOARD_IMAGE_PAYLOAD,
+    MAX_FRAME_SIZE, MAX_GRAPHICS_FRAME_SIZE, PROTOCOL_VERSION,
 };
 
 static RECEIVED_KITTY_GRAPHICS_IDS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
@@ -234,20 +234,28 @@ fn setup_terminal_with_capabilities(
         execute!(io::stdout(), DisableMouseCapture)?;
     }
 
-    // tmux doesn't understand kitty keyboard protocol push.
-    // Enable modifyOtherKeys mode 2 for tmux only for the full app client.
-    let in_tmux = enable_client_protocols && std::env::var("TMUX").is_ok();
-    if in_tmux {
-        io::stdout().write_all(b"\x1b[>4;2m")?;
+    let modify_other_keys_mode = enable_client_protocols
+        .then(|| {
+            crate::input::host_modify_other_keys_mode(
+                std::env::var("TMUX").is_ok(),
+                std::env::var("TERM_PROGRAM").ok().as_deref(),
+                std::env::var_os("WEZTERM_PANE").is_some(),
+            )
+        })
+        .flatten();
+    if let Some(mode) = modify_other_keys_mode {
+        io::stdout().write_all(mode.set_sequence())?;
         io::stdout().flush()?;
     }
 
-    Ok(TerminalGuard { in_tmux })
+    Ok(TerminalGuard {
+        reset_modify_other_keys: modify_other_keys_mode.is_some(),
+    })
 }
 
 /// Guard that restores the terminal when dropped.
 struct TerminalGuard {
-    in_tmux: bool,
+    reset_modify_other_keys: bool,
 }
 
 fn write_terminal_restore_postlude(writer: &mut impl io::Write) -> io::Result<()> {
@@ -264,11 +272,11 @@ fn set_mouse_capture(enabled: bool) -> io::Result<()> {
     }
 }
 
-fn restore_terminal_state(in_tmux: bool) {
+fn restore_terminal_state(reset_modify_other_keys: bool) {
     let _ = clear_received_kitty_graphics(&mut io::stdout());
 
     // Reset modifyOtherKeys if we enabled it.
-    if in_tmux {
+    if reset_modify_other_keys {
         let _ = io::stdout().write_all(b"\x1b[>4;0m");
         let _ = io::stdout().flush();
     }
@@ -286,7 +294,7 @@ fn restore_terminal_state(in_tmux: bool) {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        restore_terminal_state(self.in_tmux);
+        restore_terminal_state(self.reset_modify_other_keys);
     }
 }
 
@@ -632,6 +640,34 @@ async fn run_client_loop(
                     }
                     data
                 };
+                if should_bridge_clipboard_image_paste(&data) {
+                    if let Some(image) = crate::platform::read_clipboard_image() {
+                        if image.bytes.len() > MAX_CLIPBOARD_IMAGE_PAYLOAD {
+                            warn!(
+                                bytes = image.bytes.len(),
+                                max = MAX_CLIPBOARD_IMAGE_PAYLOAD,
+                                "local clipboard image is too large to bridge"
+                            );
+                            continue;
+                        }
+                        info!(
+                            bytes = image.bytes.len(),
+                            extension = image.extension,
+                            "bridging local clipboard image paste to remote server"
+                        );
+                        let msg = ClientMessage::ClipboardImage {
+                            extension: image.extension.to_owned(),
+                            data: image.bytes,
+                        };
+                        if let Err(e) = write_to_server(&mut write_stream, &msg) {
+                            return Err(ClientError::ConnectionLost(e));
+                        }
+                        continue;
+                    }
+                    info!(
+                        "clipboard image paste trigger received, but local clipboard has no image"
+                    );
+                }
                 let msg = ClientMessage::Input { data };
                 if let Err(e) = write_to_server(&mut write_stream, &msg) {
                     return Err(ClientError::ConnectionLost(e));
@@ -867,6 +903,21 @@ fn sound_from_notify_message(message: &str) -> Option<crate::sound::Sound> {
     }
 }
 
+fn should_bridge_clipboard_image_paste(data: &[u8]) -> bool {
+    if data == b"\x1b[200~\x1b[201~" {
+        return true;
+    }
+
+    let events = crate::raw_input::parse_raw_input_bytes_sync(data);
+    matches!(
+        events.as_slice(),
+        [crate::raw_input::RawInputEvent::Key(key)]
+            if key.kind == crossterm::event::KeyEventKind::Press
+                && key.modifiers == crossterm::event::KeyModifiers::CONTROL
+                && matches!(key.code, crossterm::event::KeyCode::Char('v' | 'V'))
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Clipboard forwarding
 // ---------------------------------------------------------------------------
@@ -1059,6 +1110,17 @@ fn init_logging() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipboard_image_paste_bridge_triggers_on_ctrl_v_and_empty_paste() {
+        assert!(should_bridge_clipboard_image_paste(&[0x16]));
+        assert!(should_bridge_clipboard_image_paste(b"\x1b[118;5u"));
+        assert!(should_bridge_clipboard_image_paste(b"\x1b[200~\x1b[201~"));
+        assert!(!should_bridge_clipboard_image_paste(
+            b"\x1b[200~text\x1b[201~"
+        ));
+        assert!(!should_bridge_clipboard_image_paste(b"v"));
+    }
 
     #[test]
     fn graphics_bytes_are_written_after_blit_with_saved_cursor() {

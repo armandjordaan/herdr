@@ -31,14 +31,21 @@ fn unique_test_dir() -> PathBuf {
 }
 
 struct SpawnedHerdr {
-    _master: Box<dyn MasterPty + Send>,
+    _master: Option<Box<dyn MasterPty + Send>>,
     child: Box<dyn Child + Send + Sync>,
+}
+
+impl SpawnedHerdr {
+    fn close_master(&mut self) {
+        drop(self._master.take());
+    }
 }
 
 impl Drop for SpawnedHerdr {
     fn drop(&mut self) {
         let pid = self.child.process_id();
         let _ = self.child.kill();
+        self.close_master();
 
         if let Some(pid) = pid {
             let deadline = Instant::now() + Duration::from_secs(2);
@@ -99,7 +106,7 @@ fn spawn_client_process(
     drop(pair.slave);
 
     SpawnedHerdr {
-        _master: pair.master,
+        _master: Some(pair.master),
         child,
     }
 }
@@ -142,7 +149,7 @@ fn spawn_server(
     drop(pair.slave);
 
     SpawnedHerdr {
-        _master: pair.master,
+        _master: Some(pair.master),
         child,
     }
 }
@@ -267,8 +274,8 @@ fn client_connects_and_receives_frame() {
     // Connect and handshake.
     let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
     let (version, error) =
-        client_handshake(&mut stream, 6, 80, 24).expect("handshake should succeed");
-    assert_eq!(version, 6, "server should report protocol version 6");
+        client_handshake(&mut stream, 8, 80, 24).expect("handshake should succeed");
+    assert_eq!(version, 8, "server should report protocol version 8");
     assert!(
         error.is_none(),
         "handshake should not have error: {:?}",
@@ -327,7 +334,7 @@ fn client_sees_headless_startup_config_diagnostic() {
     drop(pair.slave);
 
     let spawned = SpawnedHerdr {
-        _master: pair.master,
+        _master: Some(pair.master),
         child,
     };
     wait_for_socket(&api_socket, Duration::from_secs(10));
@@ -335,8 +342,8 @@ fn client_sees_headless_startup_config_diagnostic() {
 
     let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
     let (version, error) =
-        client_handshake(&mut stream, 6, 80, 24).expect("handshake should succeed");
-    assert_eq!(version, 6);
+        client_handshake(&mut stream, 8, 80, 24).expect("handshake should succeed");
+    assert_eq!(version, 8);
     assert!(error.is_none(), "{:?}", error);
 
     stream
@@ -384,8 +391,8 @@ fn client_input_forwarded_to_pane() {
     // Connect and handshake.
     let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
     let (version, error) =
-        client_handshake(&mut stream, 6, 80, 24).expect("handshake should succeed");
-    assert_eq!(version, 6);
+        client_handshake(&mut stream, 8, 80, 24).expect("handshake should succeed");
+    assert_eq!(version, 8);
     assert!(error.is_none(), "{:?}", error);
 
     // Send an Input message containing "echo hello\n".
@@ -438,8 +445,8 @@ fn client_resize_sends_message() {
     // Connect and handshake.
     let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
     let (version, error) =
-        client_handshake(&mut stream, 6, 80, 24).expect("handshake should succeed");
-    assert_eq!(version, 6);
+        client_handshake(&mut stream, 8, 80, 24).expect("handshake should succeed");
+    assert_eq!(version, 8);
     assert!(error.is_none(), "{:?}", error);
 
     // Drain the initial frame(s).
@@ -448,9 +455,9 @@ fn client_resize_sends_message() {
         .unwrap();
     while read_server_message(&mut stream).is_ok() {}
 
-    // Send a Resize message: ClientMessage::Resize is variant 2.
+    // Send a Resize message: ClientMessage::Resize is variant 3.
     let resize_payload = {
-        let mut buf = encode_varint_u32(2); // variant 2 = Resize
+        let mut buf = encode_varint_u32(3); // variant 3 = Resize
         buf.extend_from_slice(&encode_varint_u16(120)); // cols
         buf.extend_from_slice(&encode_varint_u16(40)); // rows
         buf.extend_from_slice(&encode_varint_u32(8)); // cell_width_px
@@ -497,8 +504,8 @@ fn server_shutdown_sends_message_to_client() {
     // Connect and handshake.
     let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
     let (version, error) =
-        client_handshake(&mut stream, 6, 80, 24).expect("handshake should succeed");
-    assert_eq!(version, 6);
+        client_handshake(&mut stream, 8, 80, 24).expect("handshake should succeed");
+    assert_eq!(version, 8);
     assert!(error.is_none(), "{:?}", error);
 
     // Send SIGINT so the server takes the graceful shutdown path and
@@ -537,6 +544,7 @@ fn server_shutdown_sends_message_to_client() {
     );
 
     // Wait for the server to exit after shutdown signal.
+    spawned.close_master();
     let _ = spawned.child.wait();
 
     drop(spawned);
@@ -616,6 +624,8 @@ fn server_crash_after_attach_causes_lost_connection_error() {
     // Prove attached before kill by waiting for at least one frame message.
     let mut thin_reader = thin_client
         ._master
+        .as_ref()
+        .expect("thin client master")
         .try_clone_reader()
         .expect("clone client PTY reader");
     let attached_before_kill = {
@@ -648,6 +658,7 @@ fn server_crash_after_attach_causes_lost_connection_error() {
             libc::kill(pid as libc::pid_t, libc::SIGKILL);
         }
     }
+    spawned.close_master();
 
     // Client should exit non-zero after connection loss.
     let mut crash_output = String::new();
@@ -725,8 +736,8 @@ fn client_receives_frame_after_pane_output() {
     // Connect and handshake.
     let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
     let (version, error) =
-        client_handshake(&mut stream, 6, 80, 24).expect("handshake should succeed");
-    assert_eq!(version, 6);
+        client_handshake(&mut stream, 8, 80, 24).expect("handshake should succeed");
+    assert_eq!(version, 8);
     assert!(error.is_none(), "{:?}", error);
 
     read_next_frame_payload(&mut stream, Duration::from_secs(10))
@@ -772,8 +783,8 @@ fn navigate_mode_keybind_dispatch_in_server() {
     // Connect and handshake.
     let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
     let (version, error) =
-        client_handshake(&mut stream, 6, 80, 24).expect("handshake should succeed");
-    assert_eq!(version, 6);
+        client_handshake(&mut stream, 8, 80, 24).expect("handshake should succeed");
+    assert_eq!(version, 8);
     assert!(error.is_none(), "{:?}", error);
 
     // Drain initial frames.
@@ -890,8 +901,8 @@ fn graceful_shutdown_sends_server_shutdown_to_client() {
     // Connect and handshake.
     let mut stream = UnixStream::connect(&client_socket).expect("should connect to client socket");
     let (version, error) =
-        client_handshake(&mut stream, 6, 80, 24).expect("handshake should succeed");
-    assert_eq!(version, 6);
+        client_handshake(&mut stream, 8, 80, 24).expect("handshake should succeed");
+    assert_eq!(version, 8);
     assert!(error.is_none(), "{:?}", error);
 
     // Drain initial frame(s).
@@ -926,6 +937,7 @@ fn graceful_shutdown_sends_server_shutdown_to_client() {
     }
 
     // Wait for the server to exit.
+    spawned.close_master();
     let _ = spawned.child.wait();
 
     drop(spawned);
@@ -979,7 +991,7 @@ fn client_receives_notify_on_agent_state_change() {
     drop(pair.slave);
 
     let spawned = SpawnedHerdr {
-        _master: pair.master,
+        _master: Some(pair.master),
         child,
     };
     wait_for_socket(&api_socket, Duration::from_secs(10));
@@ -988,8 +1000,8 @@ fn client_receives_notify_on_agent_state_change() {
     // Connect as a client and perform handshake.
     let mut stream = UnixStream::connect(&client_socket).expect("should connect");
     let (version, error) =
-        client_handshake(&mut stream, 6, 80, 24).expect("handshake should succeed");
-    assert_eq!(version, 6);
+        client_handshake(&mut stream, 8, 80, 24).expect("handshake should succeed");
+    assert_eq!(version, 8);
     assert!(error.is_none(), "{:?}", error);
 
     // Drain initial frame(s).

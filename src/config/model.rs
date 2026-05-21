@@ -1,6 +1,8 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
-use super::{CommandKeybindConfig, SoundConfig, ThemeConfig, DEFAULT_SCROLLBACK_LIMIT_BYTES};
+use super::{
+    BindingConfig, CommandKeybindConfig, SoundConfig, ThemeConfig, DEFAULT_SCROLLBACK_LIMIT_BYTES,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -34,6 +36,13 @@ pub struct ToastConfig {
     pub delivery: ToastDelivery,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct TerminalConfig {
+    /// Executable used for new interactive panes. Empty means SHELL, then /bin/sh.
+    pub default_shell: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConfigReloadStatus {
@@ -48,11 +57,25 @@ pub struct ConfigReloadReport {
     pub diagnostics: Vec<String>,
 }
 
+/// Validate `[ui]` sidebar bound configuration.
+///
+/// Returns `Some((min, max))` when `min <= max`, `None` otherwise. The two
+/// values are funneled through this helper before they reach any
+/// `u16::clamp(min, max)` call site (`u16::clamp` panics when `min > max`).
+pub fn validated_sidebar_bounds(min: u16, max: u16) -> Option<(u16, u16)> {
+    if min <= max {
+        Some((min, max))
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub onboarding: Option<bool>,
     pub theme: ThemeConfig,
+    pub terminal: TerminalConfig,
     pub keys: KeysConfig,
     pub ui: UiConfig,
     pub advanced: AdvancedConfig,
@@ -69,65 +92,81 @@ pub struct LoadedConfig {
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct KeysConfig {
-    /// Prefix key to toggle navigate mode (e.g. "ctrl+b", "f12", "esc").
+    /// Prefix key to enter prefix mode (e.g. "ctrl+b", "f12", "esc").
     pub prefix: String,
-    /// Create a new workspace. Default: "n"
-    pub new_workspace: String,
-    /// Rename the selected workspace. Default: "shift+n"
-    pub rename_workspace: String,
-    /// Close the selected workspace. Default: "shift+d"
-    pub close_workspace: String,
-    /// Optional explicit detach shortcut in server/client mode. Unset by default.
-    pub detach: String,
-    /// Reload config.toml in the running app/server. Unset by default.
-    pub reload_config: String,
-    /// Focus the currently visible notification target. Unset by default.
-    pub open_notification_target: String,
+    /// Open keybinding help. Default: "prefix+?"
+    pub help: BindingConfig,
+    /// Open settings. Default: "prefix+s"
+    pub settings: BindingConfig,
+    /// Create a new workspace. Default: "prefix+shift+n"
+    pub new_workspace: BindingConfig,
+    /// Rename the selected workspace. Default: "prefix+shift+w"
+    pub rename_workspace: BindingConfig,
+    /// Close the selected workspace. Default: "prefix+shift+d"
+    pub close_workspace: BindingConfig,
+    /// Open the workspace navigation surface. Default: "prefix+w"
+    pub workspace_picker: BindingConfig,
+    /// Detach from server/client mode, or exit --no-session mode. Default: "prefix+q".
+    pub detach: BindingConfig,
+    /// Reload config.toml in the running app/server. Default: "prefix+shift+r".
+    pub reload_config: BindingConfig,
+    /// Focus the currently visible notification target. Default: "prefix+o".
+    pub open_notification_target: BindingConfig,
     /// Select the previous workspace. Unset by default.
-    pub previous_workspace: String,
+    pub previous_workspace: BindingConfig,
     /// Select the next workspace. Unset by default.
-    pub next_workspace: String,
+    pub next_workspace: BindingConfig,
     /// Focus the previous agent shown in the agent panel. Unset by default.
-    pub previous_agent: String,
+    pub previous_agent: BindingConfig,
     /// Focus the next agent shown in the agent panel. Unset by default.
-    pub next_agent: String,
-    /// Create a new tab in the active workspace. Default: "c"
-    pub new_tab: String,
-    /// Rename the active tab. Unset by default.
-    pub rename_tab: String,
-    /// Select the previous tab. Unset by default.
-    pub previous_tab: String,
-    /// Select the next tab. Unset by default.
-    pub next_tab: String,
-    /// Close the active tab. Unset by default.
-    pub close_tab: String,
-    /// Rename the focused pane. Unset by default.
-    pub rename_pane: String,
-    /// Open the focused pane scrollback in $EDITOR. Unset by default.
-    pub edit_scrollback: String,
-    /// Focus the pane to the left in terminal mode. Unset by default.
-    pub focus_pane_left: String,
-    /// Focus the pane below in terminal mode. Unset by default.
-    pub focus_pane_down: String,
-    /// Focus the pane above in terminal mode. Unset by default.
-    pub focus_pane_up: String,
-    /// Focus the pane to the right in terminal mode. Unset by default.
-    pub focus_pane_right: String,
-    /// Split pane vertically (side by side). Default: "v"
-    pub split_vertical: String,
-    /// Split pane horizontally (stacked). Default: "-"
-    pub split_horizontal: String,
-    /// Close the focused pane. Default: "x"
-    pub close_pane: String,
-    /// Toggle zoom for the focused pane. Default: "f"
+    pub next_agent: BindingConfig,
+    /// Focus an agent by index 1-9. Unset by default.
+    pub focus_agent: BindingConfig,
+    /// Create a new tab in the active workspace. Default: "prefix+c"
+    pub new_tab: BindingConfig,
+    /// Rename the active tab. Default: "prefix+shift+t".
+    pub rename_tab: BindingConfig,
+    /// Select the previous tab. Default: "prefix+p".
+    pub previous_tab: BindingConfig,
+    /// Select the next tab. Default: "prefix+n".
+    pub next_tab: BindingConfig,
+    /// Switch to tab 1-9. Default: "prefix+1..9".
+    pub switch_tab: BindingConfig,
+    /// Switch to workspace 1-9 from prefix mode. Unset by default.
+    pub switch_workspace: BindingConfig,
+    /// Close the active tab. Default: "prefix+shift+x".
+    pub close_tab: BindingConfig,
+    /// Rename the focused pane. Default: "prefix+shift+p".
+    pub rename_pane: BindingConfig,
+    /// Open the focused pane scrollback in $EDITOR. Default: "prefix+e".
+    pub edit_scrollback: BindingConfig,
+    /// Focus the pane to the left. Default: "prefix+h".
+    pub focus_pane_left: BindingConfig,
+    /// Focus the pane below. Default: "prefix+j".
+    pub focus_pane_down: BindingConfig,
+    /// Focus the pane above. Default: "prefix+k".
+    pub focus_pane_up: BindingConfig,
+    /// Focus the pane to the right. Default: "prefix+l".
+    pub focus_pane_right: BindingConfig,
+    /// Cycle to the next pane. Default: "prefix+tab".
+    pub cycle_pane_next: BindingConfig,
+    /// Cycle to the previous pane. Default: "prefix+shift+tab".
+    pub cycle_pane_previous: BindingConfig,
+    /// Split pane vertically (side by side). Default: "prefix+v"
+    pub split_vertical: BindingConfig,
+    /// Split pane horizontally (stacked). Default: "prefix+minus"
+    pub split_horizontal: BindingConfig,
+    /// Close the focused pane. Default: "prefix+x"
+    pub close_pane: BindingConfig,
+    /// Toggle zoom for the focused pane. Default: "prefix+z"
     #[serde(alias = "fullscreen")]
-    pub zoom: String,
-    /// Enter resize mode. Default: "r"
-    pub resize_mode: String,
-    /// Toggle sidebar collapse. Default: "b"
-    pub toggle_sidebar: String,
-    /// Open the goto picker (filterable list of spaces, tabs, agents). Default: "g"
-    pub goto: String,
+    pub zoom: BindingConfig,
+    /// Enter resize mode. Default: "prefix+r"
+    pub resize_mode: BindingConfig,
+    /// Toggle sidebar collapse. Default: "prefix+b"
+    pub toggle_sidebar: BindingConfig,
+    /// Open the goto picker for workspaces, tabs, and agents. Default: "prefix+g".
+    pub goto: BindingConfig,
     /// Optional indexed shortcuts expanded over number keys 1-9.
     pub indexed: IndexedKeysConfig,
     /// Prefix-mode custom command bindings.
@@ -149,6 +188,10 @@ pub struct IndexedKeysConfig {
 #[serde(default)]
 pub struct UiConfig {
     pub sidebar_width: u16,
+    /// Minimum sidebar width (columns) when expanded. Default: 18.
+    pub sidebar_min_width: u16,
+    /// Maximum sidebar width (columns) when expanded. Default: 36.
+    pub sidebar_max_width: u16,
     /// Capture mouse input for Herdr's mouse UI. Default: true.
     pub mouse_capture: bool,
     /// Ask for confirmation before closing a workspace. Default: true.
@@ -168,6 +211,33 @@ pub struct UiConfig {
     pub sound: SoundConfig,
 }
 
+/// Cursor shape (DECSCUSR) used for the forced IME anchor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImeCursorShape {
+    Block,
+    #[default]
+    SteadyBlock,
+    Underline,
+    SteadyUnderline,
+    Bar,
+    SteadyBar,
+}
+
+impl ImeCursorShape {
+    /// Convert to DECSCUSR parameter (1–6).
+    pub fn to_decscusr(self) -> u8 {
+        match self {
+            Self::Block => 1,
+            Self::SteadyBlock => 2,
+            Self::Underline => 3,
+            Self::SteadyUnderline => 4,
+            Self::Bar => 5,
+            Self::SteadyBar => 6,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct AdvancedConfig {
@@ -183,40 +253,70 @@ pub struct ExperimentalConfig {
     pub allow_nested: bool,
     /// Experimental local Kitty graphics rendering for attached clients. Default: false.
     pub kitty_graphics: bool,
+    /// Expose the focused pane's cursor anchor to the outer terminal even when
+    /// the pane requested `?25l`, so macOS native input methods keep tracking
+    /// the candidate window when TUIs paint their own cursor (Claude Code, pi,
+    /// codex, etc.). Default: false.
+    ///
+    /// When the pane reports no cursor position, falls back to the pane's
+    /// top-left so a stable IME anchor is always available.
+    ///
+    /// Trade-off when enabled: an extra hardware cursor will be visible in the
+    /// outer terminal for apps that hide the cursor without painting a
+    /// replacement (vim normal mode, etc.). See #149.
+    pub reveal_hidden_cursor_for_cjk_ime: bool,
+    /// Restrict `reveal_hidden_cursor_for_cjk_ime` to focused panes whose
+    /// detected agent matches one of these names (case-insensitive). Empty
+    /// list means apply to any focused pane. Unknown agent names are ignored;
+    /// if the list contains no valid names, the reveal does not apply.
+    /// Accepted names: pi, claude, codex, gemini, cursor, cline, opencode,
+    /// copilot, kimi, kiro, droid, amp, grok, hermes. Default: empty.
+    pub cjk_ime_agents: Vec<String>,
+    /// Cursor shape rendered for the IME anchor when
+    /// `reveal_hidden_cursor_for_cjk_ime` is enabled. Default: "steady_block".
+    pub cjk_ime_cursor_shape: ImeCursorShape,
 }
 
 impl Default for KeysConfig {
     fn default() -> Self {
         Self {
             prefix: "ctrl+b".into(),
-            new_workspace: "n".into(),
-            rename_workspace: "shift+n".into(),
-            close_workspace: "shift+d".into(),
-            detach: "".into(),
-            reload_config: "".into(),
-            open_notification_target: "".into(),
-            previous_workspace: "".into(),
-            next_workspace: "".into(),
-            previous_agent: "".into(),
-            next_agent: "".into(),
-            new_tab: "c".into(),
-            rename_tab: "".into(),
-            previous_tab: "".into(),
-            next_tab: "".into(),
-            close_tab: "".into(),
-            rename_pane: "".into(),
-            edit_scrollback: "".into(),
-            focus_pane_left: "".into(),
-            focus_pane_down: "".into(),
-            focus_pane_up: "".into(),
-            focus_pane_right: "".into(),
-            split_vertical: "v".into(),
-            split_horizontal: "-".into(),
-            close_pane: "x".into(),
-            zoom: "f".into(),
-            resize_mode: "r".into(),
-            toggle_sidebar: "b".into(),
-            goto: "g".into(),
+            help: BindingConfig::one("prefix+?"),
+            settings: BindingConfig::one("prefix+s"),
+            new_workspace: BindingConfig::one("prefix+shift+n"),
+            rename_workspace: BindingConfig::one("prefix+shift+w"),
+            close_workspace: BindingConfig::one("prefix+shift+d"),
+            workspace_picker: BindingConfig::one("prefix+w"),
+            detach: BindingConfig::one("prefix+q"),
+            reload_config: BindingConfig::one("prefix+shift+r"),
+            open_notification_target: BindingConfig::one("prefix+o"),
+            previous_workspace: BindingConfig::empty(),
+            next_workspace: BindingConfig::empty(),
+            previous_agent: BindingConfig::empty(),
+            next_agent: BindingConfig::empty(),
+            focus_agent: BindingConfig::empty(),
+            new_tab: BindingConfig::one("prefix+c"),
+            rename_tab: BindingConfig::one("prefix+shift+t"),
+            previous_tab: BindingConfig::one("prefix+p"),
+            next_tab: BindingConfig::one("prefix+n"),
+            switch_tab: BindingConfig::one("prefix+1..9"),
+            switch_workspace: BindingConfig::empty(),
+            close_tab: BindingConfig::one("prefix+shift+x"),
+            rename_pane: BindingConfig::one("prefix+shift+p"),
+            edit_scrollback: BindingConfig::one("prefix+e"),
+            focus_pane_left: BindingConfig::one("prefix+h"),
+            focus_pane_down: BindingConfig::one("prefix+j"),
+            focus_pane_up: BindingConfig::one("prefix+k"),
+            focus_pane_right: BindingConfig::one("prefix+l"),
+            cycle_pane_next: BindingConfig::one("prefix+tab"),
+            cycle_pane_previous: BindingConfig::one("prefix+shift+tab"),
+            split_vertical: BindingConfig::one("prefix+v"),
+            split_horizontal: BindingConfig::one("prefix+minus"),
+            close_pane: BindingConfig::one("prefix+x"),
+            zoom: BindingConfig::one("prefix+z"),
+            resize_mode: BindingConfig::one("prefix+r"),
+            toggle_sidebar: BindingConfig::one("prefix+b"),
+            goto: BindingConfig::one("prefix+g"),
             indexed: IndexedKeysConfig::default(),
             command: Vec::new(),
         }
@@ -227,6 +327,8 @@ impl Default for UiConfig {
     fn default() -> Self {
         Self {
             sidebar_width: 26,
+            sidebar_min_width: 18,
+            sidebar_max_width: 36,
             mouse_capture: true,
             confirm_close: true,
             prompt_new_tab_name: true,
@@ -282,6 +384,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn terminal_default_shell_defaults_empty_and_parses() {
+        let default_config = Config::default();
+        assert!(default_config.terminal.default_shell.is_empty());
+
+        let toml = r#"
+[terminal]
+default_shell = "nu"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.terminal.default_shell, "nu");
+    }
+
+    #[test]
     fn agent_panel_scope_config_parses() {
         let toml = r#"
 [ui]
@@ -315,6 +430,79 @@ prompt_new_tab_name = false
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(!config.ui.prompt_new_tab_name);
+    }
+
+    #[test]
+    fn reveal_hidden_cursor_for_cjk_ime_default_off_and_parse() {
+        let default_config = Config::default();
+        assert!(!default_config.experimental.reveal_hidden_cursor_for_cjk_ime);
+
+        let toml = r#"
+[experimental]
+reveal_hidden_cursor_for_cjk_ime = true
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.experimental.reveal_hidden_cursor_for_cjk_ime);
+    }
+
+    #[test]
+    fn cjk_ime_cursor_shape_default_steady_block_and_parse() {
+        let default_config = Config::default();
+        assert_eq!(
+            default_config.experimental.cjk_ime_cursor_shape,
+            ImeCursorShape::SteadyBlock
+        );
+
+        let toml = r#"
+[experimental]
+cjk_ime_cursor_shape = "bar"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            config.experimental.cjk_ime_cursor_shape,
+            ImeCursorShape::Bar
+        );
+    }
+
+    #[test]
+    fn cjk_ime_agents_default_empty_and_parse() {
+        let default_config = Config::default();
+        assert!(default_config.experimental.cjk_ime_agents.is_empty());
+
+        let toml = r#"
+[experimental]
+cjk_ime_agents = ["claude", "codex"]
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            config.experimental.cjk_ime_agents,
+            vec!["claude".to_string(), "codex".to_string()]
+        );
+    }
+
+    #[test]
+    fn sidebar_bounds_default_and_parse() {
+        let default_config = Config::default();
+        assert_eq!(default_config.ui.sidebar_min_width, 18);
+        assert_eq!(default_config.ui.sidebar_max_width, 36);
+
+        let toml = r#"
+[ui]
+sidebar_min_width = 12
+sidebar_max_width = 80
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.ui.sidebar_min_width, 12);
+        assert_eq!(config.ui.sidebar_max_width, 80);
+    }
+
+    #[test]
+    fn validated_sidebar_bounds_rejects_inverted() {
+        assert_eq!(validated_sidebar_bounds(18, 36), Some((18, 36)));
+        assert_eq!(validated_sidebar_bounds(20, 20), Some((20, 20)));
+        assert_eq!(validated_sidebar_bounds(0, u16::MAX), Some((0, u16::MAX)));
+        assert_eq!(validated_sidebar_bounds(50, 30), None);
+        assert_eq!(validated_sidebar_bounds(u16::MAX, 0), None);
     }
 
     #[test]

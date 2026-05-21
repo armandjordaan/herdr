@@ -17,10 +17,12 @@ pub(super) enum SettingsAction {
     SaveSound(bool),
     SaveToastDelivery(ToastDelivery),
     SaveAgentBorderLabels(bool),
+    InstallRecommendedIntegrations,
 }
 
 impl App {
     pub(crate) fn handle_settings_key(&mut self, key: KeyEvent) {
+        let previous_section = self.state.settings.section;
         if let Some(action) = update_settings_state(&mut self.state, key) {
             match action {
                 SettingsAction::SaveTheme(name) => self.save_theme(&name),
@@ -29,7 +31,15 @@ impl App {
                 SettingsAction::SaveAgentBorderLabels(enabled) => {
                     self.save_agent_border_labels(enabled)
                 }
+                SettingsAction::InstallRecommendedIntegrations => {
+                    self.install_recommended_integrations()
+                }
             }
+        }
+        if previous_section != SettingsSection::Integrations
+            && self.state.settings.section == SettingsSection::Integrations
+        {
+            self.refresh_integration_recommendations();
         }
     }
 }
@@ -84,6 +94,13 @@ fn cancel_settings(state: &mut AppState) {
     super::modal::leave_modal(state);
 }
 
+fn integrations_need_install(state: &AppState) -> bool {
+    state
+        .integration_recommendations
+        .iter()
+        .any(crate::integration::IntegrationRecommendation::needs_install)
+}
+
 fn apply_settings(state: &mut AppState) -> Option<SettingsAction> {
     match state.settings.section {
         SettingsSection::Theme => {
@@ -93,6 +110,10 @@ fn apply_settings(state: &mut AppState) -> Option<SettingsAction> {
             super::modal::leave_modal(state);
             Some(SettingsAction::SaveTheme(theme_name))
         }
+        SettingsSection::Integrations if integrations_need_install(state) => {
+            Some(SettingsAction::InstallRecommendedIntegrations)
+        }
+        SettingsSection::Integrations => None,
         _ => {
             super::modal::leave_modal(state);
             None
@@ -187,8 +208,8 @@ pub(super) fn update_settings_state(state: &mut AppState, key: KeyEvent) -> Opti
                 state.settings.list.selected = toast_delivery_index(state.toast_delivery());
             }
             KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
-                state.settings.section = SettingsSection::Theme;
-                state.settings.list.selected = current_theme_index(&state.theme_name);
+                state.settings.section = SettingsSection::Integrations;
+                state.settings.list.selected = 0;
             }
             _ => {
                 if let Some(super::modal::ModalAction::Close) =
@@ -198,16 +219,44 @@ pub(super) fn update_settings_state(state: &mut AppState, key: KeyEvent) -> Opti
                 }
             }
         },
+        SettingsSection::Integrations => match key.code {
+            KeyCode::Enter | KeyCode::Char(' ') if integrations_need_install(state) => {
+                return Some(SettingsAction::InstallRecommendedIntegrations);
+            }
+            KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
+                state.settings.section = SettingsSection::PaneLabels;
+                state.settings.list.selected = usize::from(!state.agent_border_labels_enabled());
+            }
+            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
+                state.settings.section = SettingsSection::Theme;
+                state.settings.list.selected = current_theme_index(&state.theme_name);
+            }
+            _ => match super::modal::modal_action_from_key(&key, super::modal::SETTINGS_ACTIONS) {
+                Some(super::modal::ModalAction::Apply) => return apply_settings(state),
+                Some(super::modal::ModalAction::Close) => cancel_settings(state),
+                _ => {}
+            },
+        },
     }
 
     None
 }
 
 pub(crate) fn open_settings(state: &mut AppState) {
+    open_settings_at(state, SettingsSection::Theme);
+}
+
+pub(crate) fn open_settings_at(state: &mut AppState, section: SettingsSection) {
     state.settings.original_palette = Some(state.palette.clone());
     state.settings.original_theme = Some(state.theme_name.clone());
-    state.settings.section = SettingsSection::Theme;
-    state.settings.list.selected = current_theme_index(&state.theme_name);
+    state.settings.section = section;
+    state.settings.list.selected = match section {
+        SettingsSection::Theme => current_theme_index(&state.theme_name),
+        SettingsSection::Sound => usize::from(!state.sound_enabled()),
+        SettingsSection::Toast => toast_delivery_index(state.toast_delivery()),
+        SettingsSection::PaneLabels => usize::from(!state.agent_border_labels_enabled()),
+        SettingsSection::Integrations => 0,
+    };
     state.mode = Mode::Settings;
 }
 
@@ -234,7 +283,12 @@ impl AppState {
         }
         let mut x = inner.x;
         for section in SettingsSection::ALL {
-            let width = section.label().len() as u16 + 2;
+            let badge_width = if self.settings_section_has_badge(*section) {
+                2
+            } else {
+                0
+            };
+            let width = section.label().len() as u16 + 2 + badge_width;
             if col >= x && col < x + width {
                 return Some(*section);
             }
@@ -290,6 +344,7 @@ impl AppState {
                     None
                 }
             }
+            SettingsSection::Integrations => None,
         }
     }
 
@@ -305,6 +360,7 @@ impl AppState {
                         SettingsSection::PaneLabels => {
                             usize::from(!self.agent_border_labels_enabled())
                         }
+                        SettingsSection::Integrations => 0,
                     });
                     return None;
                 }
@@ -327,19 +383,19 @@ impl AppState {
                             let enabled = idx == 0;
                             Some(SettingsAction::SaveAgentBorderLabels(enabled))
                         }
+                        SettingsSection::Integrations => None,
                     };
                 }
 
                 let inner = self.settings_inner_rect();
-                let (apply, close) = crate::ui::settings_button_rects(inner);
-                match super::modal::modal_action_from_buttons(
-                    mouse.column,
-                    mouse.row,
-                    &[
-                        (apply, super::modal::ModalAction::Apply),
-                        (close, super::modal::ModalAction::Close),
-                    ],
-                ) {
+                let show_primary = crate::ui::settings_show_primary_action(self);
+                let (apply, close) =
+                    crate::ui::settings_button_rects(inner, self.settings.section, show_primary);
+                let mut buttons = vec![(close, super::modal::ModalAction::Close)];
+                if let Some(apply) = apply {
+                    buttons.insert(0, (apply, super::modal::ModalAction::Apply));
+                }
+                match super::modal::modal_action_from_buttons(mouse.column, mouse.row, &buttons) {
                     Some(super::modal::ModalAction::Apply) => apply_settings(self),
                     Some(super::modal::ModalAction::Close) => {
                         cancel_settings(self);
@@ -414,6 +470,24 @@ mod tests {
     }
 
     #[test]
+    fn integrations_enter_does_nothing_when_nothing_needs_install() {
+        let mut state = state_with_workspaces(&["test"]);
+        open_settings_at(&mut state, SettingsSection::Integrations);
+
+        let enter_action = update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+        assert_eq!(enter_action, None);
+
+        let space_action = update_settings_state(
+            &mut state,
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::empty()),
+        );
+        assert_eq!(space_action, None);
+    }
+
+    #[test]
     fn settings_hover_does_not_change_selection() {
         let mut app = app_for_mouse_test();
         open_settings(&mut app.state);
@@ -423,5 +497,71 @@ mod tests {
         app.handle_mouse(mouse(MouseEventKind::Moved, area.x + 2, area.y + 2));
 
         assert_eq!(app.state.settings.list.selected, 0);
+    }
+
+    #[test]
+    fn integration_update_badge_only_tracks_outdated_recommendations() {
+        let mut state = state_with_workspaces(&["test"]);
+        state.integration_recommendations = vec![integration_recommendation(
+            crate::integration::IntegrationStatusKind::NotInstalled,
+            true,
+        )];
+        assert!(!state.integration_updates_available());
+
+        state.integration_recommendations = vec![integration_recommendation(
+            crate::integration::IntegrationStatusKind::NotInstalled,
+            false,
+        )];
+        assert!(!state.integration_updates_available());
+
+        state.integration_recommendations = vec![integration_recommendation(
+            crate::integration::IntegrationStatusKind::Current,
+            true,
+        )];
+        assert!(!state.integration_updates_available());
+
+        state.integration_recommendations = vec![integration_recommendation(
+            crate::integration::IntegrationStatusKind::Outdated,
+            true,
+        )];
+        assert!(state.integration_updates_available());
+    }
+
+    #[test]
+    fn settings_tab_hit_area_includes_integration_update_badge() {
+        let mut state = state_with_workspaces(&["test"]);
+        state.integration_recommendations = vec![integration_recommendation(
+            crate::integration::IntegrationStatusKind::Outdated,
+            true,
+        )];
+        open_settings(&mut state);
+
+        let inner = state.settings_inner_rect();
+        let tab_y = inner.y + 1;
+        let integrations_x = inner.x
+            + SettingsSection::ALL[..SettingsSection::ALL.len() - 1]
+                .iter()
+                .map(|section| section.label().len() as u16 + 3)
+                .sum::<u16>();
+        let dotted_width = SettingsSection::Integrations.label().len() as u16 + 4;
+
+        assert_eq!(
+            state.settings_tab_at(integrations_x + dotted_width - 1, tab_y),
+            Some(SettingsSection::Integrations)
+        );
+    }
+
+    fn integration_recommendation(
+        state: crate::integration::IntegrationStatusKind,
+        available: bool,
+    ) -> crate::integration::IntegrationRecommendation {
+        crate::integration::IntegrationRecommendation {
+            target: crate::api::schema::IntegrationTarget::Claude,
+            label: "claude",
+            command: "claude",
+            available,
+            path: std::path::PathBuf::from("/tmp/herdr-test-integration"),
+            state,
+        }
     }
 }

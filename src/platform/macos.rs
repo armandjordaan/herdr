@@ -5,7 +5,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
-use super::{ClipboardCommand, ForegroundJob, ForegroundProcess, Signal};
+use super::{
+    read_limited_reader, ClipboardCommand, ClipboardImage, ForegroundJob, ForegroundProcess,
+    LimitedRead, Signal,
+};
 
 const PROC_PGRP_ONLY: u32 = 2;
 
@@ -200,6 +203,54 @@ pub fn write_clipboard(bytes: &[u8]) -> bool {
         },
         bytes,
     )
+}
+
+pub fn read_clipboard_image() -> Option<ClipboardImage> {
+    let path = std::env::temp_dir().join(format!(
+        "herdr-clipboard-image-{}-{}.png",
+        std::process::id(),
+        unique_timestamp_nanos()
+    ));
+    let script = format!(
+        "set png_data to (the clipboard as «class PNGf»)\nset fp to open for access POSIX file \"{}\" with write permission\nwrite png_data to fp\nclose access fp",
+        path.display()
+    );
+
+    let status = Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok()?;
+
+    if !status.success() {
+        let _ = std::fs::remove_file(&path);
+        return None;
+    }
+
+    let bytes = match std::fs::File::open(&path).ok().and_then(|file| {
+        read_limited_reader(file, crate::server::protocol::MAX_CLIPBOARD_IMAGE_PAYLOAD).ok()
+    }) {
+        Some(LimitedRead::Complete(bytes)) => bytes,
+        Some(LimitedRead::Empty | LimitedRead::Oversized) | None => {
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
+    };
+    let _ = std::fs::remove_file(&path);
+    Some(ClipboardImage {
+        bytes,
+        extension: "png",
+    })
+}
+
+fn unique_timestamp_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0)
 }
 
 /// Show a native macOS notification.

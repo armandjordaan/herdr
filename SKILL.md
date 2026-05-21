@@ -5,6 +5,8 @@ description: "Control herdr from inside it. Manage workspaces and tabs, split pa
 
 # herdr — agent skill
 
+before using this skill, check that `HERDR_ENV=1`. if it is not set to `1`, say you are not running inside a herdr-managed pane and stop. do not inspect or control the focused herdr pane from outside herdr.
+
 you are running inside herdr, a terminal-native agent multiplexer. herdr gives you workspaces, tabs, and panes — each pane is a real terminal with its own shell, agent, server, or log stream — and you can control all of it from the cli.
 
 this means you can:
@@ -19,7 +21,7 @@ this means you can:
 
 the `herdr` binary is available in your PATH. its workspace, tab, pane, and wait commands talk to the running herdr instance over a local unix socket.
 
-if you need the raw protocol or full api reference, read [`SOCKET_API.md`](./SOCKET_API.md).
+if you need the raw protocol or full api reference, read the [socket api docs](https://herdr.dev/docs/socket-api/).
 
 ## concepts
 

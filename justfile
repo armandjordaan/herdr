@@ -17,6 +17,7 @@ ci: lint
 # Check formatting + run unit tests + maintenance script tests
 check: ci
     python3 -m unittest scripts.test_changelog scripts.test_vendor_libghostty_vt
+    @echo "docs reminder: if this changes user-facing behavior, make sure the relevant release docs are updated or called out before release."
 
 # Install repo-local git hooks
 install-hooks:
@@ -36,11 +37,36 @@ website-build:
 build-libghostty-vt:
     scripts/build_vendored_libghostty_vt.sh
 
-# Check that public docs and changelog have been finalized from docs/next before release
+# Check that release docs and changelog have been finalized from docs/next before release
 release-docs-check:
-    @for file in README.md CONFIGURATION.md INTEGRATIONS.md SOCKET_API.md CHANGELOG.md; do \
+    @for file in README.md CHANGELOG.md; do \
         if ! diff -u "$file" "docs/next/$file"; then \
             echo "error: $file differs from docs/next/$file; finalize release docs before releasing"; \
+            exit 1; \
+        fi; \
+    done
+    @for file in CONFIGURATION.md INTEGRATIONS.md SOCKET_API.md; do \
+        if [ -e "$file" ]; then \
+            echo "error: $file was replaced by website docs; remove the root copy"; \
+            exit 1; \
+        fi; \
+    done
+    @test -d docs/next/website/src/content/docs
+    @for file in website/src/content/docs/*.mdx; do \
+        staged="docs/next/website/src/content/docs/$(basename "$file")"; \
+        if [ ! -f "$staged" ]; then \
+            echo "error: $staged is missing; docs/next/website/src/content/docs must mirror website/src/content/docs"; \
+            exit 1; \
+        fi; \
+        if ! diff -u "$file" "$staged"; then \
+            echo "error: $file differs from $staged; finalize website docs before releasing"; \
+            exit 1; \
+        fi; \
+    done
+    @for file in docs/next/website/src/content/docs/*.mdx; do \
+        released="website/src/content/docs/$(basename "$file")"; \
+        if [ ! -f "$released" ]; then \
+            echo "error: $file has no matching released website doc"; \
             exit 1; \
         fi; \
     done

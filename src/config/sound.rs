@@ -30,13 +30,16 @@ pub struct AgentSoundOverrides {
     pub codex: AgentSoundSetting,
     pub gemini: AgentSoundSetting,
     pub cursor: AgentSoundSetting,
+    pub agy: AgentSoundSetting,
     pub cline: AgentSoundSetting,
     pub open_code: AgentSoundSetting,
     pub github_copilot: AgentSoundSetting,
     pub kimi: AgentSoundSetting,
+    pub kiro: AgentSoundSetting,
     pub droid: AgentSoundSetting,
     pub amp: AgentSoundSetting,
     pub grok: AgentSoundSetting,
+    pub hermes: AgentSoundSetting,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -117,13 +120,16 @@ impl AgentSoundOverrides {
             Some(Agent::Codex) => self.codex,
             Some(Agent::Gemini) => self.gemini,
             Some(Agent::Cursor) => self.cursor,
+            Some(Agent::Antigravity) => self.agy,
             Some(Agent::Cline) => self.cline,
             Some(Agent::OpenCode) => self.open_code,
             Some(Agent::GithubCopilot) => self.github_copilot,
             Some(Agent::Kimi) => self.kimi,
+            Some(Agent::Kiro) => self.kiro,
             Some(Agent::Droid) => self.droid,
             Some(Agent::Amp) => self.amp,
             Some(Agent::Grok) => self.grok,
+            Some(Agent::Hermes) => self.hermes,
             None => AgentSoundSetting::Default,
         }
     }
@@ -149,13 +155,16 @@ impl Default for AgentSoundOverrides {
             codex: AgentSoundSetting::Default,
             gemini: AgentSoundSetting::Default,
             cursor: AgentSoundSetting::Default,
+            agy: AgentSoundSetting::Default,
             cline: AgentSoundSetting::Default,
             open_code: AgentSoundSetting::Default,
             github_copilot: AgentSoundSetting::Default,
             kimi: AgentSoundSetting::Default,
+            kiro: AgentSoundSetting::Default,
             droid: AgentSoundSetting::Off,
             amp: AgentSoundSetting::Default,
             grok: AgentSoundSetting::Default,
+            hermes: AgentSoundSetting::Default,
         }
     }
 }

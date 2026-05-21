@@ -9,6 +9,12 @@ use ratatui::{
 use super::widgets::{panel_contrast_fg, render_panel_shell};
 use crate::app::AppState;
 
+fn prefix_rhs_label(bindings: &crate::config::ActionKeybinds) -> String {
+    bindings
+        .prefix_rhs_label()
+        .unwrap_or_else(|| "unset".to_string())
+}
+
 fn render_bottom_bar(frame: &mut Frame, area: Rect, line: Line<'_>, bg: ratatui::style::Color) {
     frame.render_widget(Clear, area);
     let buf = frame.buffer_mut();
@@ -16,6 +22,38 @@ fn render_bottom_bar(frame: &mut Frame, area: Rect, line: Line<'_>, bg: ratatui:
         buf[(x, area.y)].set_style(Style::default().bg(bg));
     }
     frame.render_widget(Paragraph::new(line), area);
+}
+
+pub(super) fn render_prefix_overlay(app: &AppState, frame: &mut Frame, area: Rect) {
+    let key = Style::default()
+        .fg(app.palette.accent)
+        .add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(app.palette.overlay0);
+    let mode_style = Style::default()
+        .fg(panel_contrast_fg(&app.palette))
+        .bg(app.palette.accent)
+        .add_modifier(Modifier::BOLD);
+
+    let workspace_picker = prefix_rhs_label(&app.keybinds.workspace_picker);
+    let help = prefix_rhs_label(&app.keybinds.help);
+    let prefix = crate::config::format_key_combo((app.prefix_code, app.prefix_mods));
+
+    let line = Line::from(vec![
+        Span::styled(" PREFIX ", mode_style),
+        Span::raw(" "),
+        Span::styled("esc", key),
+        Span::styled(" cancel  ", dim),
+        Span::styled(prefix, key),
+        Span::styled(" send prefix  ", dim),
+        Span::styled(workspace_picker, key),
+        Span::styled(" workspace nav  ", dim),
+        Span::styled(help, key),
+        Span::styled(" keybinds", dim),
+    ]);
+
+    let overlay_y = area.y + area.height.saturating_sub(1);
+    let overlay_area = Rect::new(area.x, overlay_y, area.width, 1);
+    render_bottom_bar(frame, overlay_area, line, app.palette.panel_bg);
 }
 
 pub(super) fn render_navigate_overlay(app: &AppState, frame: &mut Frame, area: Rect) {
@@ -30,6 +68,16 @@ pub(super) fn render_navigate_overlay(app: &AppState, frame: &mut Frame, area: R
         .add_modifier(Modifier::BOLD);
 
     let kb = &app.keybinds;
+    let new_tab = prefix_rhs_label(&kb.new_tab);
+    let split_vertical = prefix_rhs_label(&kb.split_vertical);
+    let split_horizontal = prefix_rhs_label(&kb.split_horizontal);
+    let close_pane = prefix_rhs_label(&kb.close_pane);
+    let zoom = prefix_rhs_label(&kb.zoom);
+    let resize = prefix_rhs_label(&kb.resize_mode);
+    let goto = prefix_rhs_label(&kb.goto);
+    let help = prefix_rhs_label(&kb.help);
+    let settings = prefix_rhs_label(&kb.settings);
+    let detach = prefix_rhs_label(&kb.detach);
     let line = Line::from(vec![
         Span::styled(" NAVIGATE ", mode_style),
         Span::raw(" "),
@@ -39,26 +87,26 @@ pub(super) fn render_navigate_overlay(app: &AppState, frame: &mut Frame, area: R
         Span::styled(" ws  ", dim),
         Span::styled("⇥", key),
         Span::styled(" pane  ", dim),
-        Span::styled(kb.new_tab_label.as_str(), key),
+        Span::styled(new_tab, key),
         Span::styled(" new tab  ", dim),
-        Span::styled(kb.split_vertical_label.as_str(), key),
+        Span::styled(split_vertical, key),
         Span::styled(" split│  ", dim),
-        Span::styled(kb.split_horizontal_label.as_str(), key),
+        Span::styled(split_horizontal, key),
         Span::styled(" split─  ", dim),
-        Span::styled(kb.close_pane_label.as_str(), key),
+        Span::styled(close_pane, key),
         Span::styled(" close  ", dim),
-        Span::styled(kb.zoom_label.as_str(), key),
+        Span::styled(zoom, key),
         Span::styled(" zoom  ", dim),
-        Span::styled(kb.resize_mode_label.as_str(), key),
+        Span::styled(resize, key),
         Span::styled(" resize  ", dim),
-        Span::styled(kb.goto_label.as_str(), key),
+        Span::styled(goto, key),
         Span::styled(" goto  ", dim),
-        Span::styled("?", key),
+        Span::styled(help, key),
         Span::styled(" keybinds  ", dim),
-        Span::styled("s", key),
+        Span::styled(settings, key),
         Span::styled(" settings  ", dim),
-        Span::styled("q", key),
-        Span::styled(" quit", dim),
+        Span::styled(detach, key),
+        Span::styled(" detach", dim),
     ]);
 
     let overlay_y = area.y + area.height.saturating_sub(1);
@@ -103,53 +151,32 @@ pub(super) fn render_global_launcher_menu(app: &AppState, frame: &mut Frame) {
         let selected = idx == app.global_menu.highlighted;
         let rect = Rect::new(inner.x, y, inner.width, 1);
 
-        if *item == "update ready" {
-            let line = if selected {
-                Line::from(vec![
-                    Span::styled(
-                        " update ready ",
-                        Style::default()
-                            .fg(panel_contrast_fg(&app.palette))
-                            .bg(app.palette.accent)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        "● ",
-                        Style::default()
-                            .fg(panel_contrast_fg(&app.palette))
-                            .bg(app.palette.accent)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ])
-            } else {
-                Line::from(vec![
-                    Span::styled(" update ready ", Style::default().fg(app.palette.text)),
-                    Span::styled(
-                        "● ",
-                        Style::default()
-                            .fg(app.palette.accent)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ])
-            };
-            frame.render_widget(Paragraph::new(line).alignment(Alignment::Left), rect);
-            continue;
-        }
-
-        let style = if selected {
-            Style::default()
-                .fg(panel_contrast_fg(&app.palette))
-                .bg(app.palette.accent)
-                .add_modifier(Modifier::BOLD)
+        let selected_style = Style::default()
+            .fg(panel_contrast_fg(&app.palette))
+            .bg(app.palette.accent)
+            .add_modifier(Modifier::BOLD);
+        let item_style = if selected {
+            selected_style
         } else {
             Style::default().fg(app.palette.text)
         };
-        frame.render_widget(
-            Paragraph::new(format!(" {item} "))
-                .style(style)
-                .alignment(Alignment::Left),
-            rect,
-        );
+        let badge_style = if selected {
+            selected_style
+        } else {
+            Style::default()
+                .fg(app.palette.accent)
+                .add_modifier(Modifier::BOLD)
+        };
+
+        let line = if app.global_menu_item_has_badge(item) {
+            Line::from(vec![
+                Span::styled(" ●", badge_style),
+                Span::styled(format!(" {item} "), item_style),
+            ])
+        } else {
+            Line::from(Span::styled(format!(" {item} "), item_style))
+        };
+        frame.render_widget(Paragraph::new(line).alignment(Alignment::Left), rect);
     }
 }
 
