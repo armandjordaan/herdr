@@ -10,6 +10,7 @@ use crate::{
     },
     layout::{PaneInfo, SplitBorder},
     selection::Selection,
+    terminal::TerminalRuntimeRegistry,
 };
 
 #[cfg(test)]
@@ -25,7 +26,11 @@ use super::{
 };
 
 impl AppState {
-    pub(crate) fn handle_pane_mouse_only(&mut self, mouse: MouseEvent) {
+    pub(crate) fn handle_pane_mouse_only(
+        &mut self,
+        terminal_runtimes: &TerminalRuntimeRegistry,
+        mouse: MouseEvent,
+    ) {
         if self.mode != Mode::Terminal {
             return;
         }
@@ -38,29 +43,35 @@ impl AppState {
             | MouseEventKind::ScrollDown
             | MouseEventKind::ScrollLeft
             | MouseEventKind::ScrollRight => {
-                self.forward_pane_reported_wheel(&info, mouse);
+                self.forward_pane_reported_wheel(terminal_runtimes, &info, mouse);
             }
             MouseEventKind::Down(_) | MouseEventKind::Up(_) | MouseEventKind::Drag(_) => {
-                self.forward_pane_mouse_button(&info, mouse);
+                self.forward_pane_mouse_button(terminal_runtimes, &info, mouse);
             }
             MouseEventKind::Moved => {}
         }
     }
 
-    pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) -> Option<SettingsAction> {
+    pub(super) fn handle_mouse(
+        &mut self,
+        terminal_runtimes: &mut TerminalRuntimeRegistry,
+        mouse: MouseEvent,
+    ) -> Option<SettingsAction> {
         if self.mode == Mode::Onboarding {
             self.handle_onboarding_mouse(mouse);
             return None;
         }
 
-        if self.clickable_toast_at(mouse.column, mouse.row)
+        if self.mode == Mode::Terminal
+            && self.clickable_toast_at(mouse.column, mouse.row)
             && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
         {
             self.focus_toast_target();
             return None;
         }
 
-        if self.clickable_toast_at(mouse.column, mouse.row)
+        if self.mode == Mode::Terminal
+            && self.clickable_toast_at(mouse.column, mouse.row)
             && matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left))
         {
             return None;
@@ -130,6 +141,33 @@ impl AppState {
             && mouse.row >= sidebar.y
             && mouse.row < sidebar.y + sidebar.height;
 
+        if self.mode == Mode::OpenExistingWorktree {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    if let Some(open) = &mut self.worktree_open {
+                        open.selected = open.selected.saturating_sub(1);
+                    }
+                    return None;
+                }
+                MouseEventKind::ScrollDown => {
+                    if let Some(open) = &mut self.worktree_open {
+                        open.selected =
+                            (open.selected + 1).min(open.entries.len().saturating_sub(1));
+                    }
+                    return None;
+                }
+                _ => {}
+            }
+        }
+
+        if matches!(
+            self.mode,
+            Mode::NewLinkedWorktree | Mode::OpenExistingWorktree | Mode::ConfirmRemoveWorktree
+        ) && !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        {
+            return None;
+        }
+
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.selection = None;
@@ -156,6 +194,135 @@ impl AppState {
                         Some(ModalAction::Confirm) => confirm_close_accept(self),
                         Some(ModalAction::Cancel) | None => confirm_close_cancel(self),
                         _ => {}
+                    }
+                    return None;
+                }
+
+                if self.mode == Mode::NewLinkedWorktree {
+                    if let Some(inner) =
+                        crate::ui::new_linked_worktree_inner_rect(self.screen_rect())
+                    {
+                        let (create, cancel) = crate::ui::new_linked_worktree_button_rects(inner);
+                        match modal_action_from_buttons(
+                            mouse.column,
+                            mouse.row,
+                            &[
+                                (create, ModalAction::Confirm),
+                                (cancel, ModalAction::Cancel),
+                            ],
+                        ) {
+                            Some(ModalAction::Confirm) => {
+                                self.request_submit_worktree_create = true;
+                            }
+                            Some(ModalAction::Cancel)
+                                if !self
+                                    .worktree_create
+                                    .as_ref()
+                                    .is_some_and(|create| create.creating) =>
+                            {
+                                self.worktree_create = None;
+                                self.name_input.clear();
+                                self.name_input_replace_on_type = false;
+                                leave_modal(self);
+                            }
+                            _ => {}
+                        }
+                    }
+                    return None;
+                }
+
+                if self.mode == Mode::OpenExistingWorktree {
+                    if let Some(open) = self.worktree_open.as_ref() {
+                        if let Some(inner) = crate::ui::open_existing_worktree_inner_rect(
+                            self.screen_rect(),
+                            open.entries.len(),
+                        ) {
+                            let max_rows = inner.height.saturating_sub(4) as usize;
+                            let start = crate::ui::open_existing_worktree_visible_start(
+                                open.selected,
+                                max_rows,
+                            );
+                            let row_idx = if rect_contains(inner, mouse.column, mouse.row) {
+                                mouse
+                                    .row
+                                    .checked_sub(inner.y.saturating_add(2))
+                                    .map(usize::from)
+                                    .filter(|row| *row < max_rows)
+                                    .and_then(|row| {
+                                        let entry_idx = start + row;
+                                        (entry_idx < open.entries.len()).then_some(entry_idx)
+                                    })
+                            } else {
+                                None
+                            };
+                            if let Some(entry_idx) = row_idx {
+                                if let Some(open) = &mut self.worktree_open {
+                                    open.selected = entry_idx;
+                                }
+                                self.request_submit_worktree_open = true;
+                                return None;
+                            }
+
+                            let (open_button, cancel) =
+                                crate::ui::open_existing_worktree_button_rects(inner);
+                            match modal_action_from_buttons(
+                                mouse.column,
+                                mouse.row,
+                                &[
+                                    (open_button, ModalAction::Confirm),
+                                    (cancel, ModalAction::Cancel),
+                                ],
+                            ) {
+                                Some(ModalAction::Confirm) => {
+                                    self.request_submit_worktree_open = true;
+                                }
+                                Some(ModalAction::Cancel) => {
+                                    self.worktree_open = None;
+                                    leave_modal(self);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    return None;
+                }
+
+                if self.mode == Mode::ConfirmRemoveWorktree {
+                    if let Some(popup) = crate::ui::remove_worktree_popup_rect(self.screen_rect()) {
+                        let inner = Rect::new(
+                            popup.x + 1,
+                            popup.y + 1,
+                            popup.width.saturating_sub(2),
+                            popup.height.saturating_sub(2),
+                        );
+                        let force_confirmation = self
+                            .worktree_remove
+                            .as_ref()
+                            .is_some_and(|remove| remove.force_confirmation);
+                        let (remove, cancel) =
+                            crate::ui::remove_worktree_button_rects(inner, force_confirmation);
+                        match modal_action_from_buttons(
+                            mouse.column,
+                            mouse.row,
+                            &[
+                                (remove, ModalAction::Confirm),
+                                (cancel, ModalAction::Cancel),
+                            ],
+                        ) {
+                            Some(ModalAction::Confirm) => {
+                                self.request_submit_worktree_remove = true;
+                            }
+                            Some(ModalAction::Cancel)
+                                if !self
+                                    .worktree_remove
+                                    .as_ref()
+                                    .is_some_and(|remove| remove.removing) =>
+                            {
+                                self.worktree_remove = None;
+                                leave_modal(self);
+                            }
+                            _ => {}
+                        }
                     }
                     return None;
                 }
@@ -187,7 +354,7 @@ impl AppState {
                     let item_idx = self.context_menu_item_at(mouse.column, mouse.row);
                     if let Some(menu) = self.context_menu.take() {
                         if let Some(idx) = item_idx {
-                            apply_context_menu_action(self, menu, idx);
+                            apply_context_menu_action(self, terminal_runtimes, menu, idx);
                         } else {
                             leave_modal(self);
                         }
@@ -224,7 +391,7 @@ impl AppState {
                     }
 
                     if let Some((pane_id, target)) =
-                        self.scrollbar_target_at(mouse.column, mouse.row)
+                        self.scrollbar_target_at(terminal_runtimes, mouse.column, mouse.row)
                     {
                         self.focus_pane(pane_id);
                         match target {
@@ -237,7 +404,11 @@ impl AppState {
                                 });
                             }
                             ScrollbarClickTarget::Track { offset_from_bottom } => {
-                                self.set_pane_scroll_offset(pane_id, offset_from_bottom);
+                                self.set_pane_scroll_offset(
+                                    terminal_runtimes,
+                                    pane_id,
+                                    offset_from_bottom,
+                                );
                             }
                         }
                         if self.mode != Mode::Terminal {
@@ -321,6 +492,29 @@ impl AppState {
                         return None;
                     }
 
+                    let cards = if self.view.workspace_card_areas.is_empty() {
+                        crate::ui::compute_workspace_card_areas(self, self.view.sidebar_rect)
+                    } else {
+                        self.view.workspace_card_areas.clone()
+                    };
+                    if let Some(card) = cards.iter().find(|card| {
+                        mouse.row == card.rect.y
+                            && mouse.column == card.rect.x
+                            && mouse.column < card.rect.x + card.rect.width
+                    }) {
+                        if let Some((key, collapsed)) =
+                            crate::ui::workspace_parent_group_state(self, card.ws_idx)
+                        {
+                            if collapsed {
+                                self.collapsed_space_keys.remove(&key);
+                            } else {
+                                self.collapsed_space_keys.insert(key);
+                            }
+                            self.mark_session_dirty();
+                            return None;
+                        }
+                    }
+
                     if let Some(idx) = self.workspace_at_row(mouse.row) {
                         self.workspace_press = Some(WorkspacePressState {
                             ws_idx: idx,
@@ -370,7 +564,7 @@ impl AppState {
                         self.mode = Mode::Terminal;
                     }
 
-                    if self.forward_pane_mouse_button(&info, mouse) {
+                    if self.forward_pane_mouse_button(terminal_runtimes, &info, mouse) {
                         self.selection = None;
                         self.selection_autoscroll = None;
                         return None;
@@ -384,7 +578,7 @@ impl AppState {
                         info.id,
                         row,
                         col,
-                        self.pane_scroll_metrics(info.id),
+                        self.pane_scroll_metrics(terminal_runtimes, info.id),
                     ));
                 } else if let Some(info) = self.view.pane_infos.iter().find(|p| {
                     mouse.column >= p.rect.x
@@ -402,13 +596,13 @@ impl AppState {
 
             MouseEventKind::Drag(MouseButton::Left) => {
                 if self.selection.is_some() {
-                    self.update_selection_drag(mouse.column, mouse.row);
+                    self.update_selection_drag(terminal_runtimes, mouse.column, mouse.row);
                     return None;
                 }
 
                 if self.drag.is_none() {
                     if let Some(info) = self.pane_mouse_target(mouse.column, mouse.row).cloned() {
-                        if self.forward_pane_mouse_button(&info, mouse) {
+                        if self.forward_pane_mouse_button(terminal_runtimes, &info, mouse) {
                             self.selection = None;
                             self.selection_autoscroll = None;
                             return None;
@@ -422,7 +616,11 @@ impl AppState {
                     if let Some(press) = &self.workspace_press {
                         let delta_col = mouse.column.abs_diff(press.start_col);
                         let delta_row = mouse.row.abs_diff(press.start_row);
-                        if delta_col.max(delta_row) >= WORKSPACE_DRAG_THRESHOLD {
+                        let can_reorder = self
+                            .workspaces
+                            .get(press.ws_idx)
+                            .is_some_and(|ws| ws.worktree_space().is_none());
+                        if can_reorder && delta_col.max(delta_row) >= WORKSPACE_DRAG_THRESHOLD {
                             self.drag = Some(DragState {
                                 target: DragTarget::WorkspaceReorder {
                                     source_ws_idx: press.ws_idx,
@@ -504,11 +702,16 @@ impl AppState {
                             grab_row_offset,
                         } => {
                             if let Some(offset_from_bottom) = self.scrollbar_offset_for_pane_row(
+                                terminal_runtimes,
                                 *pane_id,
                                 mouse.row,
                                 *grab_row_offset,
                             ) {
-                                self.set_pane_scroll_offset(*pane_id, offset_from_bottom);
+                                self.set_pane_scroll_offset(
+                                    terminal_runtimes,
+                                    *pane_id,
+                                    offset_from_bottom,
+                                );
                             }
                         }
                         DragTarget::SidebarDivider => {
@@ -535,14 +738,14 @@ impl AppState {
                         self.selection = None;
                         self.selection_autoscroll = None;
                     } else {
-                        self.copy_selection();
+                        self.copy_selection(terminal_runtimes);
                     }
                     return None;
                 }
 
                 if self.drag.is_none() {
                     if let Some(info) = self.pane_mouse_target(mouse.column, mouse.row).cloned() {
-                        if self.forward_pane_mouse_button(&info, mouse) {
+                        if self.forward_pane_mouse_button(terminal_runtimes, &info, mouse) {
                             self.selection = None;
                             self.selection_autoscroll = None;
                             self.workspace_press = None;
@@ -597,7 +800,7 @@ impl AppState {
                             self.selection = None;
                             self.selection_autoscroll = None;
                         } else {
-                            self.copy_selection();
+                            self.copy_selection(terminal_runtimes);
                         }
                     }
                 }
@@ -607,7 +810,7 @@ impl AppState {
                 if !in_sidebar =>
             {
                 if let Some(info) = self.pane_mouse_target(mouse.column, mouse.row).cloned() {
-                    let _ = self.forward_pane_mouse_button(&info, mouse);
+                    let _ = self.forward_pane_mouse_button(terminal_runtimes, &info, mouse);
                 }
             }
 
@@ -622,12 +825,12 @@ impl AppState {
             }
 
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-                if !in_sidebar && self.scroll_selection_with_wheel(mouse) => {}
+                if !in_sidebar && self.scroll_selection_with_wheel(terminal_runtimes, mouse) => {}
 
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown if !in_sidebar => {
                 self.selection = None;
                 self.selection_autoscroll = None;
-                self.handle_terminal_wheel(mouse);
+                self.handle_terminal_wheel(terminal_runtimes, mouse);
             }
 
             MouseEventKind::ScrollUp if in_sidebar => {
@@ -645,9 +848,8 @@ impl AppState {
                     crate::ui::workspace_list_scroll_metrics(self, self.workspace_list_rect()),
                 ) {
                     self.scroll_workspace_list(-1);
-                } else if self.selected > 0 {
-                    self.selected -= 1;
-                    self.ensure_workspace_visible(self.selected);
+                } else {
+                    self.move_selected_workspace_by_visible_delta(-1);
                 }
             }
             MouseEventKind::ScrollDown if in_sidebar => {
@@ -665,9 +867,8 @@ impl AppState {
                     crate::ui::workspace_list_scroll_metrics(self, self.workspace_list_rect()),
                 ) {
                     self.scroll_workspace_list(1);
-                } else if !self.workspaces.is_empty() && self.selected < self.workspaces.len() - 1 {
-                    self.selected += 1;
-                    self.ensure_workspace_visible(self.selected);
+                } else {
+                    self.move_selected_workspace_by_visible_delta(1);
                 }
             }
 
@@ -679,6 +880,8 @@ impl AppState {
             }
 
             MouseEventKind::Down(MouseButton::Right) if in_sidebar && !self.sidebar_collapsed => {
+                self.workspace_press = None;
+                self.tab_press = None;
                 if self
                     .workspace_list_scrollbar_target_at(mouse.column, mouse.row)
                     .is_some()
@@ -687,8 +890,40 @@ impl AppState {
                 }
                 if let Some(idx) = self.workspace_at_row(mouse.row) {
                     self.selected = idx;
+                    let kind = self
+                        .workspaces
+                        .get(idx)
+                        .and_then(|ws| {
+                            let group_state = crate::ui::workspace_parent_group_state(self, idx);
+                            let git_space = ws.git_space().cloned().or_else(|| {
+                                ws.resolved_identity_cwd_from(&self.terminals, terminal_runtimes)
+                                    .as_deref()
+                                    .and_then(crate::workspace::git_space_metadata)
+                            });
+                            let is_linked_worktree = ws.worktree_space().map_or_else(
+                                || {
+                                    git_space
+                                        .as_ref()
+                                        .is_some_and(|space| space.is_linked_worktree)
+                                },
+                                |space| space.is_linked_worktree,
+                            );
+                            let show_git_menu = ws.worktree_space().is_some()
+                                || git_space
+                                    .as_ref()
+                                    .is_some_and(|space| !space.is_linked_worktree);
+                            show_git_menu.then_some(ContextMenuKind::GitWorkspace {
+                                ws_idx: idx,
+                                is_linked_worktree,
+                                has_worktree_children: group_state.is_some(),
+                                collapsed: group_state
+                                    .as_ref()
+                                    .is_some_and(|(_, collapsed)| *collapsed),
+                            })
+                        })
+                        .unwrap_or(ContextMenuKind::Workspace { ws_idx: idx });
                     self.context_menu = Some(ContextMenuState {
-                        kind: ContextMenuKind::Workspace { ws_idx: idx },
+                        kind,
                         x: mouse.column,
                         y: mouse.row,
                         list: MenuListState::new(0),
@@ -1070,17 +1305,29 @@ impl AppState {
         self.mode = Mode::Terminal;
     }
 
-    pub(crate) fn scroll_pane_up(&self, pane_id: crate::layout::PaneId, lines: usize) {
+    pub(crate) fn scroll_pane_up(
+        &self,
+        terminal_runtimes: &TerminalRuntimeRegistry,
+        pane_id: crate::layout::PaneId,
+        lines: usize,
+    ) {
         if let Some(ws_idx) = self.active {
-            if let Some(rt) = self.runtime_for_pane_in_workspace(ws_idx, pane_id) {
+            if let Some(rt) = self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)
+            {
                 rt.scroll_up(lines);
             }
         }
     }
 
-    pub(crate) fn scroll_pane_down(&self, pane_id: crate::layout::PaneId, lines: usize) {
+    pub(crate) fn scroll_pane_down(
+        &self,
+        terminal_runtimes: &TerminalRuntimeRegistry,
+        pane_id: crate::layout::PaneId,
+        lines: usize,
+    ) {
         if let Some(ws_idx) = self.active {
-            if let Some(rt) = self.runtime_for_pane_in_workspace(ws_idx, pane_id) {
+            if let Some(rt) = self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)
+            {
                 rt.scroll_down(lines);
             }
         }
@@ -1088,24 +1335,33 @@ impl AppState {
 
     pub(crate) fn pane_scroll_metrics(
         &self,
+        terminal_runtimes: &TerminalRuntimeRegistry,
         pane_id: crate::layout::PaneId,
     ) -> Option<crate::pane::ScrollMetrics> {
         self.active
-            .and_then(|i| self.runtime_for_pane_in_workspace(i, pane_id))
+            .and_then(|i| self.runtime_for_pane_in_workspace(terminal_runtimes, i, pane_id))
             .and_then(crate::terminal::TerminalRuntime::scroll_metrics)
     }
 
-    pub(super) fn handle_terminal_wheel(&mut self, mouse: MouseEvent) {
-        const LINES_PER_NOTCH: usize = 3;
+    pub(super) fn handle_terminal_wheel(
+        &mut self,
+        terminal_runtimes: &TerminalRuntimeRegistry,
+        mouse: MouseEvent,
+    ) {
+        let lines_per_notch = self.mouse_scroll_lines;
 
         if let Some(info) = self.pane_at(mouse.column, mouse.row).cloned() {
             self.focus_pane(info.id);
-            if self.forward_pane_wheel(&info, mouse) {
+            if self.forward_pane_wheel(terminal_runtimes, &info, mouse) {
                 return;
             }
             match mouse.kind {
-                MouseEventKind::ScrollUp => self.scroll_pane_up(info.id, LINES_PER_NOTCH),
-                MouseEventKind::ScrollDown => self.scroll_pane_down(info.id, LINES_PER_NOTCH),
+                MouseEventKind::ScrollUp => {
+                    self.scroll_pane_up(terminal_runtimes, info.id, lines_per_notch)
+                }
+                MouseEventKind::ScrollDown => {
+                    self.scroll_pane_down(terminal_runtimes, info.id, lines_per_notch)
+                }
                 _ => {}
             }
             return;
@@ -1114,29 +1370,39 @@ impl AppState {
         if let Some(info) = self.pane_frame_at(mouse.column, mouse.row).cloned() {
             self.focus_pane(info.id);
             match mouse.kind {
-                MouseEventKind::ScrollUp => self.scroll_pane_up(info.id, LINES_PER_NOTCH),
-                MouseEventKind::ScrollDown => self.scroll_pane_down(info.id, LINES_PER_NOTCH),
+                MouseEventKind::ScrollUp => {
+                    self.scroll_pane_up(terminal_runtimes, info.id, lines_per_notch)
+                }
+                MouseEventKind::ScrollDown => {
+                    self.scroll_pane_down(terminal_runtimes, info.id, lines_per_notch)
+                }
                 _ => {}
             }
             return;
         }
 
         if let Some(ws_idx) = self.active {
-            if let Some(rt) = self.focused_runtime_in_workspace(ws_idx) {
+            if let Some(rt) = self.focused_runtime_in_workspace(terminal_runtimes, ws_idx) {
                 match mouse.kind {
-                    MouseEventKind::ScrollUp => rt.scroll_up(LINES_PER_NOTCH),
-                    MouseEventKind::ScrollDown => rt.scroll_down(LINES_PER_NOTCH),
+                    MouseEventKind::ScrollUp => rt.scroll_up(lines_per_notch),
+                    MouseEventKind::ScrollDown => rt.scroll_down(lines_per_notch),
                     _ => {}
                 }
             }
         }
     }
 
-    pub(super) fn forward_pane_mouse_button(&self, info: &PaneInfo, mouse: MouseEvent) -> bool {
+    pub(super) fn forward_pane_mouse_button(
+        &self,
+        terminal_runtimes: &TerminalRuntimeRegistry,
+        info: &PaneInfo,
+        mouse: MouseEvent,
+    ) -> bool {
         let Some(ws_idx) = self.active else {
             return false;
         };
-        let Some(rt) = self.runtime_for_pane_in_workspace(ws_idx, info.id) else {
+        let Some(rt) = self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id)
+        else {
             return false;
         };
         let column = mouse.column.saturating_sub(info.inner_rect.x);
@@ -1151,11 +1417,17 @@ impl AppState {
         true
     }
 
-    fn forward_pane_reported_wheel(&self, info: &PaneInfo, mouse: MouseEvent) -> bool {
+    fn forward_pane_reported_wheel(
+        &self,
+        terminal_runtimes: &TerminalRuntimeRegistry,
+        info: &PaneInfo,
+        mouse: MouseEvent,
+    ) -> bool {
         let Some(ws_idx) = self.active else {
             return false;
         };
-        let Some(rt) = self.runtime_for_pane_in_workspace(ws_idx, info.id) else {
+        let Some(rt) = self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id)
+        else {
             return false;
         };
         if !rt
@@ -1177,11 +1449,17 @@ impl AppState {
         true
     }
 
-    pub(super) fn forward_pane_wheel(&self, info: &PaneInfo, mouse: MouseEvent) -> bool {
+    pub(super) fn forward_pane_wheel(
+        &self,
+        terminal_runtimes: &TerminalRuntimeRegistry,
+        info: &PaneInfo,
+        mouse: MouseEvent,
+    ) -> bool {
         let Some(ws_idx) = self.active else {
             return false;
         };
-        let Some(rt) = self.runtime_for_pane_in_workspace(ws_idx, info.id) else {
+        let Some(rt) = self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id)
+        else {
             return false;
         };
         match rt.wheel_routing() {
@@ -1215,11 +1493,13 @@ impl AppState {
 
     pub(super) fn set_pane_scroll_offset(
         &self,
+        terminal_runtimes: &TerminalRuntimeRegistry,
         pane_id: crate::layout::PaneId,
         offset_from_bottom: usize,
     ) {
         if let Some(ws_idx) = self.active {
-            if let Some(rt) = self.runtime_for_pane_in_workspace(ws_idx, pane_id) {
+            if let Some(rt) = self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)
+            {
                 rt.set_scroll_offset_from_bottom(offset_from_bottom);
             }
         }
@@ -1227,6 +1507,7 @@ impl AppState {
 
     pub(super) fn scrollbar_target_at(
         &self,
+        terminal_runtimes: &TerminalRuntimeRegistry,
         col: u16,
         row: u16,
     ) -> Option<(crate::layout::PaneId, ScrollbarClickTarget)> {
@@ -1239,7 +1520,7 @@ impl AppState {
                     && row < track.y + track.height
             })
         })?;
-        let rt = self.runtime_for_pane_in_workspace(ws_idx, info.id)?;
+        let rt = self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id)?;
         let metrics = rt.scroll_metrics()?;
         if metrics.max_offset_from_bottom == 0 {
             return None;
@@ -1259,6 +1540,7 @@ impl AppState {
 
     pub(super) fn scrollbar_offset_for_pane_row(
         &self,
+        terminal_runtimes: &TerminalRuntimeRegistry,
         pane_id: crate::layout::PaneId,
         row: u16,
         grab_row_offset: u16,
@@ -1270,7 +1552,7 @@ impl AppState {
             .iter()
             .find(|info| info.id == pane_id)?;
         let track = crate::ui::pane_scrollbar_rect(info)?;
-        let rt = self.runtime_for_pane_in_workspace(ws_idx, pane_id)?;
+        let rt = self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)?;
         let metrics = rt.scroll_metrics()?;
         if metrics.max_offset_from_bottom == 0 {
             return None;
@@ -1318,7 +1600,8 @@ mod tests {
     use ratatui::layout::{Direction, Rect};
 
     use super::super::{
-        app_for_mouse_test, capture_snapshot, handle_context_menu_key, mouse, root_layout_ratio,
+        app_for_mouse_test, capture_snapshot, handle_context_menu_key, mouse, numbered_lines_bytes,
+        root_layout_ratio,
     };
     use super::*;
     use crate::{
@@ -1326,6 +1609,71 @@ mod tests {
         detect::{Agent, AgentState},
         workspace::Workspace,
     };
+
+    #[tokio::test]
+    async fn terminal_wheel_uses_configured_mouse_scroll_lines() {
+        let mut app = app_for_mouse_test();
+        let mut ws = Workspace::test_new("test");
+        let pane_id = ws.tabs[0].root_pane;
+        let pane_infos = ws.tabs[0].layout.panes(Rect::new(26, 2, 80, 18));
+        let info = pane_infos[0].clone();
+        ws.tabs[0].runtimes.insert(
+            pane_id,
+            crate::terminal::TerminalRuntime::test_with_scrollback_bytes(
+                info.inner_rect.width,
+                info.inner_rect.height,
+                16 * 1024,
+                &numbered_lines_bytes(64),
+            ),
+        );
+
+        app.state.workspaces = vec![ws];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.mode = Mode::Terminal;
+        app.state.view.pane_infos = pane_infos;
+        app.state.mouse_scroll_lines = 7;
+
+        app.handle_mouse(mouse(
+            MouseEventKind::ScrollUp,
+            info.inner_rect.x + 1,
+            info.inner_rect.y + 1,
+        ));
+
+        let metrics = app
+            .state
+            .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, pane_id)
+            .and_then(crate::terminal::TerminalRuntime::scroll_metrics)
+            .expect("scroll metrics after wheel");
+        assert_eq!(metrics.offset_from_bottom, 7);
+    }
+
+    fn sample_worktree_open_state() -> crate::app::state::WorktreeOpenState {
+        crate::app::state::WorktreeOpenState {
+            source_workspace_id: "source".into(),
+            source_existing_membership: None,
+            source_checkout_path: "/repo/herdr".into(),
+            source_repo_root: "/repo/herdr".into(),
+            repo_key: "repo-key".into(),
+            repo_name: "herdr".into(),
+            entries: vec![
+                crate::app::state::WorktreeOpenEntry {
+                    path: "/repo/herdr".into(),
+                    branch: Some("main".into()),
+                    is_linked_worktree: false,
+                    already_open_ws_idx: Some(0),
+                },
+                crate::app::state::WorktreeOpenEntry {
+                    path: "/repo/herdr-issue".into(),
+                    branch: Some("worktree/issue".into()),
+                    is_linked_worktree: true,
+                    already_open_ws_idx: None,
+                },
+            ],
+            selected: 0,
+            error: None,
+        }
+    }
 
     #[test]
     fn hovering_context_menu_updates_highlight() {
@@ -1375,6 +1723,11 @@ mod tests {
                 pane_id: target_pane,
                 agent: Some(Agent::Pi),
                 state: AgentState::Idle,
+                visible_blocker: false,
+                visible_idle: false,
+                visible_working: false,
+                process_exited: false,
+                observed_at: std::time::Instant::now(),
             });
         crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
 
@@ -1389,6 +1742,40 @@ mod tests {
         assert_eq!(app.state.workspaces[1].focused_pane_id(), Some(target_pane));
         assert!(app.state.toast.is_none());
         assert_eq!(app.state.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn toast_click_does_not_steal_mouse_from_settings_overlay() {
+        let mut app = app_for_mouse_test();
+        let active = Workspace::test_new("active");
+        let background = Workspace::test_new("background");
+        let target_pane = background.tabs[0].root_pane;
+        let workspace_id = background.id.clone();
+
+        app.state.workspaces = vec![active, background];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.toast = Some(crate::app::state::ToastNotification {
+            kind: crate::app::state::ToastKind::Finished,
+            title: "pi finished".into(),
+            context: "background · 2".into(),
+            target: Some(crate::app::state::ToastTarget {
+                workspace_id,
+                pane_id: target_pane,
+            }),
+        });
+        app.state.mode = Mode::Settings;
+        crate::ui::compute_view(&mut app.state, Rect::new(0, 0, 106, 20));
+
+        let hit = app.state.view.toast_hit_area;
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            hit.x + 1,
+            hit.y + 1,
+        ));
+
+        assert_eq!(app.state.active, Some(0));
+        assert!(app.state.toast.is_some());
     }
 
     #[test]
@@ -1419,6 +1806,131 @@ mod tests {
     }
 
     #[test]
+    fn clicking_open_worktree_row_selects_and_requests_open() {
+        let mut app = app_for_mouse_test();
+        app.state.mode = Mode::OpenExistingWorktree;
+        app.state.worktree_open = Some(sample_worktree_open_state());
+        let inner =
+            crate::ui::open_existing_worktree_inner_rect(app.state.screen_rect(), 2).unwrap();
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            inner.x + 1,
+            inner.y + 3,
+        ));
+
+        assert_eq!(app.state.worktree_open.as_ref().unwrap().selected, 1);
+        assert!(app.state.request_submit_worktree_open);
+    }
+
+    #[test]
+    fn clicking_open_worktree_buttons_requests_open_or_cancels() {
+        let mut app = app_for_mouse_test();
+        app.state.mode = Mode::OpenExistingWorktree;
+        app.state.worktree_open = Some(sample_worktree_open_state());
+        let inner =
+            crate::ui::open_existing_worktree_inner_rect(app.state.screen_rect(), 2).unwrap();
+        let (open, _) = crate::ui::open_existing_worktree_button_rects(inner);
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            open.x,
+            open.y,
+        ));
+
+        assert!(app.state.worktree_open.is_some());
+        assert!(app.state.request_submit_worktree_open);
+
+        let mut app = app_for_mouse_test();
+        app.state.mode = Mode::OpenExistingWorktree;
+        app.state.worktree_open = Some(sample_worktree_open_state());
+        let inner =
+            crate::ui::open_existing_worktree_inner_rect(app.state.screen_rect(), 2).unwrap();
+        let (_, cancel) = crate::ui::open_existing_worktree_button_rects(inner);
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            cancel.x,
+            cancel.y,
+        ));
+
+        assert!(app.state.worktree_open.is_none());
+        assert_eq!(app.state.mode, Mode::Navigate);
+    }
+
+    #[test]
+    fn scrolling_open_worktree_picker_moves_selection() {
+        let mut app = app_for_mouse_test();
+        app.state.mode = Mode::OpenExistingWorktree;
+        app.state.worktree_open = Some(sample_worktree_open_state());
+
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, 1, 1));
+        assert_eq!(app.state.worktree_open.as_ref().unwrap().selected, 1);
+
+        app.handle_mouse(mouse(MouseEventKind::ScrollUp, 1, 1));
+        assert_eq!(app.state.worktree_open.as_ref().unwrap().selected, 0);
+    }
+
+    #[test]
+    fn clicking_remove_worktree_buttons_requests_remove_or_cancels() {
+        let mut app = app_for_mouse_test();
+        app.state.mode = Mode::ConfirmRemoveWorktree;
+        app.state.worktree_remove = Some(crate::app::state::WorktreeRemoveState {
+            workspace_id: "issue".into(),
+            repo_root: "/repo/herdr".into(),
+            path: "/repo/herdr-issue".into(),
+            error: None,
+            removing: false,
+            force_confirmation: false,
+        });
+        let popup = crate::ui::remove_worktree_popup_rect(app.state.screen_rect()).unwrap();
+        let inner = Rect::new(
+            popup.x + 1,
+            popup.y + 1,
+            popup.width.saturating_sub(2),
+            popup.height.saturating_sub(2),
+        );
+        let (remove, _) = crate::ui::remove_worktree_button_rects(inner, false);
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            remove.x,
+            remove.y,
+        ));
+
+        assert!(app.state.worktree_remove.is_some());
+        assert!(app.state.request_submit_worktree_remove);
+
+        let mut app = app_for_mouse_test();
+        app.state.mode = Mode::ConfirmRemoveWorktree;
+        app.state.worktree_remove = Some(crate::app::state::WorktreeRemoveState {
+            workspace_id: "issue".into(),
+            repo_root: "/repo/herdr".into(),
+            path: "/repo/herdr-issue".into(),
+            error: None,
+            removing: false,
+            force_confirmation: false,
+        });
+        let popup = crate::ui::remove_worktree_popup_rect(app.state.screen_rect()).unwrap();
+        let inner = Rect::new(
+            popup.x + 1,
+            popup.y + 1,
+            popup.width.saturating_sub(2),
+            popup.height.saturating_sub(2),
+        );
+        let (_, cancel) = crate::ui::remove_worktree_button_rects(inner, false);
+
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            cancel.x,
+            cancel.y,
+        ));
+
+        assert!(app.state.worktree_remove.is_none());
+        assert_eq!(app.state.mode, Mode::Navigate);
+    }
+
+    #[test]
     fn clicking_confirm_close_accepts_after_workspace_context_menu_close() {
         let mut app = app_for_mouse_test();
         app.state.workspaces = vec![Workspace::test_new("a"), Workspace::test_new("b")];
@@ -1435,6 +1947,7 @@ mod tests {
         app.state.mode = Mode::ContextMenu;
         handle_context_menu_key(
             &mut app.state,
+            &mut app.terminal_runtimes,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
         );
         assert_eq!(app.state.mode, Mode::ConfirmClose);
@@ -1456,6 +1969,56 @@ mod tests {
 
         assert_eq!(app.state.workspaces.len(), 1);
         assert_eq!(app.state.workspaces[0].display_name(), "a");
+    }
+
+    #[tokio::test]
+    async fn keyboard_context_menu_split_keeps_new_runtime() {
+        let mut app = app_for_mouse_test();
+        app.state.default_shell = "/usr/bin/true".into();
+        let (workspace, terminal, runtime) = Workspace::new(
+            std::env::current_dir().unwrap_or_else(|_| "/".into()),
+            24,
+            80,
+            app.state.pane_scrollback_limit_bytes,
+            app.state.host_terminal_theme,
+            &app.state.default_shell,
+            app.event_tx.clone(),
+            app.render_notify.clone(),
+            app.render_dirty.clone(),
+        )
+        .expect("workspace should spawn");
+        app.state.workspaces = vec![workspace];
+        app.terminal_runtimes.insert(terminal.id.clone(), runtime);
+        app.state.terminals.insert(terminal.id.clone(), terminal);
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let runtime_count = app.terminal_runtimes.len();
+        app.state.context_menu = Some(ContextMenuState {
+            kind: ContextMenuKind::Pane {
+                pane_id,
+                has_manual_label: false,
+            },
+            x: 2,
+            y: 2,
+            list: MenuListState::new(1),
+        });
+        app.state.mode = Mode::ContextMenu;
+
+        handle_context_menu_key(
+            &mut app.state,
+            &mut app.terminal_runtimes,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+
+        assert_eq!(app.state.mode, Mode::Terminal);
+        assert_eq!(app.state.workspaces[0].tabs[0].layout.pane_count(), 2);
+        assert_eq!(app.terminal_runtimes.len(), runtime_count + 1);
+
+        let runtimes: Vec<_> = app.terminal_runtimes.drain().collect();
+        for (_terminal_id, runtime) in runtimes {
+            runtime.shutdown();
+        }
     }
 
     #[test]

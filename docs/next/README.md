@@ -181,9 +181,10 @@ automatic detection works out of the box. process name matching plus terminal ou
 | [hermes agent](https://github.com/NousResearch/hermes-agent) | ✓ | ✓ | ✓ |
 | cursor agent | ✓ | ✓ | ✓ |
 | antigravity cli | ✓ | ✓ | ✓ |
+| kimi code cli | ✓ | ✓ | ✓ |
 | [kiro cli](https://kiro.dev/docs/cli/) | ✓ | ✓ | — |
 
-detected but not fully tested: gemini cli, cline, kimi, github copilot cli.
+detected but not fully tested: gemini cli, cline, github copilot cli.
 
 for agents outside the built-in list, herdr still works as a terminal multiplexer with workspaces, panes, and tiling. custom integrations can report agent labels over the socket api. see the [socket api docs](https://herdr.dev/docs/socket-api/).
 
@@ -212,6 +213,7 @@ press `ctrl+b` to enter prefix mode. default actions are prefix-first and tmux-l
 | `prefix+1..9` | switch tab |
 | `prefix+w` | workspace navigation |
 | `prefix+shift+n` | new workspace |
+| `prefix+shift+g` | new worktree |
 | `prefix+shift+w` | rename workspace |
 | `prefix+shift+d` | close workspace |
 | `prefix+h/j/k/l` | focus pane |

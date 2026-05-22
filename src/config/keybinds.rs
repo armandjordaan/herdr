@@ -246,6 +246,9 @@ pub struct Keybinds {
     pub help: ActionKeybinds,
     pub settings: ActionKeybinds,
     pub new_workspace: ActionKeybinds,
+    pub new_worktree: ActionKeybinds,
+    pub open_worktree: ActionKeybinds,
+    pub remove_worktree: ActionKeybinds,
     pub rename_workspace: ActionKeybinds,
     pub close_workspace: ActionKeybinds,
     pub workspace_picker: ActionKeybinds,
@@ -377,6 +380,9 @@ impl Config {
             help: action!("keys.help", &self.keys.help),
             settings: action!("keys.settings", &self.keys.settings),
             new_workspace: action!("keys.new_workspace", &self.keys.new_workspace),
+            new_worktree: action!("keys.new_worktree", &self.keys.new_worktree),
+            open_worktree: action!("keys.open_worktree", &self.keys.open_worktree),
+            remove_worktree: action!("keys.remove_worktree", &self.keys.remove_worktree),
             rename_workspace: action!("keys.rename_workspace", &self.keys.rename_workspace),
             close_workspace: action!("keys.close_workspace", &self.keys.close_workspace),
             workspace_picker: action!("keys.workspace_picker", &self.keys.workspace_picker),
@@ -818,6 +824,7 @@ pub(super) fn parse_key_combo(s: &str) -> Option<KeyCombo> {
     }
 
     let key_str = key_str?;
+    let single_char = single_key_char(key_str);
     let lower = key_str.to_lowercase();
     let code = match lower.as_str() {
         "space" | " " => KeyCode::Char(' '),
@@ -846,8 +853,8 @@ pub(super) fn parse_key_combo(s: &str) -> Option<KeyCombo> {
         "ampersand" => KeyCode::Char('&'),
         "backtick" => KeyCode::Char('`'),
         "plus" => KeyCode::Char('+'),
-        s if s.len() == 1 => {
-            let ch = key_str.chars().next().unwrap();
+        _ if single_char.is_some() => {
+            let ch = single_char?;
             if ch.is_ascii_uppercase() {
                 modifiers |= KeyModifiers::SHIFT;
                 KeyCode::Char(ch.to_ascii_lowercase())
@@ -860,6 +867,16 @@ pub(super) fn parse_key_combo(s: &str) -> Option<KeyCombo> {
     };
 
     Some(normalize_key_combo((code, modifiers)))
+}
+
+fn single_key_char(s: &str) -> Option<char> {
+    let mut chars = s.chars();
+    let ch = chars.next()?;
+    if chars.next().is_none() {
+        Some(ch)
+    } else {
+        None
+    }
 }
 
 fn parse_key_combo_with_diagnostic(
@@ -1003,6 +1020,34 @@ mod tests {
     }
 
     #[test]
+    fn parse_unicode_char_combo() {
+        assert_eq!(
+            parse_key_combo("ö"),
+            Some((KeyCode::Char('ö'), KeyModifiers::empty()))
+        );
+        assert_eq!(
+            parse_key_combo("alt+é"),
+            Some((KeyCode::Char('é'), KeyModifiers::ALT))
+        );
+    }
+
+    #[test]
+    fn unicode_prefix_config_is_valid() {
+        let config: Config = toml::from_str(
+            r#"
+[keys]
+prefix = "ö"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.prefix_key(),
+            (KeyCode::Char('ö'), KeyModifiers::empty())
+        );
+        assert!(config.collect_diagnostics().is_empty());
+    }
+
+    #[test]
     fn parse_shift_tab_as_backtab() {
         assert_eq!(
             parse_key_combo("shift+tab"),
@@ -1043,6 +1088,25 @@ next_tab = "prefix+n"
                 KeyModifiers::empty()
             ))]
         );
+    }
+
+    #[test]
+    fn new_worktree_defaults_to_prefix_shift_g() {
+        let kb = Config::default().keybinds();
+        assert_eq!(
+            binding_triggers(&kb.new_worktree),
+            vec![BindingTrigger::Prefix((
+                KeyCode::Char('g'),
+                KeyModifiers::SHIFT
+            ))]
+        );
+    }
+
+    #[test]
+    fn open_and_remove_worktree_keybinds_are_unset_by_default() {
+        let kb = Config::default().keybinds();
+        assert!(kb.open_worktree.bindings.is_empty());
+        assert!(kb.remove_worktree.bindings.is_empty());
     }
 
     #[test]

@@ -17,6 +17,7 @@ mod session;
 pub mod state;
 mod terminal_targets;
 mod theme_sync;
+mod worktrees;
 
 use std::collections::{HashMap, HashSet};
 use std::future::pending;
@@ -62,6 +63,7 @@ pub(crate) struct OverlayPaneState {
 
 pub struct App {
     pub state: AppState,
+    pub(crate) terminal_runtimes: crate::terminal::TerminalRuntimeRegistry,
     pub event_tx: mpsc::Sender<AppEvent>,
     pub(crate) event_rx: mpsc::Receiver<AppEvent>,
     pub(crate) api_rx: tokio::sync::mpsc::UnboundedReceiver<crate::api::ApiRequestMessage>,
@@ -224,7 +226,7 @@ impl App {
 
         // Try to restore previous session
         let mut restored_terminals = std::collections::HashMap::new();
-        let mut restored_terminal_runtimes = std::collections::HashMap::new();
+        let mut restored_terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
         let (
             workspaces,
             active,
@@ -233,6 +235,7 @@ impl App {
             sidebar_width,
             sidebar_width_source,
             sidebar_section_split,
+            collapsed_space_keys,
         ) = if no_session {
             (
                 Vec::new(),
@@ -242,6 +245,7 @@ impl App {
                 config.ui.sidebar_width,
                 state::SidebarWidthSource::ConfigDefault,
                 0.5_f32,
+                std::collections::HashSet::new(),
             )
         } else if let Some(snap) = crate::persist::load() {
             let (ws, terminals, terminal_runtimes) = crate::persist::restore(
@@ -255,7 +259,7 @@ impl App {
                 render_dirty.clone(),
             );
             restored_terminals = terminals;
-            restored_terminal_runtimes = terminal_runtimes;
+            restored_terminal_runtimes = terminal_runtimes.into();
             if ws.is_empty() {
                 crate::logging::session_restored(0, "empty");
                 (
@@ -270,6 +274,7 @@ impl App {
                         state::SidebarWidthSource::ConfigDefault
                     },
                     snap.sidebar_section_split.unwrap_or(0.5),
+                    snap.collapsed_space_keys,
                 )
             } else {
                 crate::logging::session_restored(ws.len(), "ok");
@@ -287,6 +292,7 @@ impl App {
                         state::SidebarWidthSource::ConfigDefault
                     },
                     snap.sidebar_section_split.unwrap_or(0.5),
+                    snap.collapsed_space_keys,
                 )
             }
         } else {
@@ -298,6 +304,7 @@ impl App {
                 config.ui.sidebar_width,
                 state::SidebarWidthSource::ConfigDefault,
                 0.5_f32,
+                std::collections::HashSet::new(),
             )
         };
 
@@ -318,6 +325,8 @@ impl App {
             );
             (18, 36)
         });
+
+        let worktree_directory = crate::worktree::expand_tilde_path(&config.worktrees.directory);
 
         info!(
             pane_scrollback_limit_bytes = config.advanced.scrollback_limit_bytes,
@@ -346,7 +355,6 @@ impl App {
 
         let mut state = AppState {
             terminals: std::collections::HashMap::new(),
-            terminal_runtimes: std::collections::HashMap::new(),
             direct_attach_resize_locks: std::collections::HashSet::new(),
             workspaces,
             active,
@@ -357,12 +365,24 @@ impl App {
             detach_requested: false,
             request_new_workspace: false,
             request_new_tab: false,
+            request_new_linked_worktree: None,
+            request_open_existing_worktree: None,
+            request_new_workspace_cwd: None,
+            request_remove_linked_worktree: None,
+            request_submit_worktree_create: false,
+            request_submit_worktree_open: false,
+            request_submit_worktree_remove: false,
             request_reload_config: false,
             request_client_sound_config_reload: false,
             request_clipboard_write: None,
             creating_new_tab: false,
             requested_new_tab_name: None,
             rename_pane_target: None,
+            worktree_create: None,
+            worktree_open: None,
+            worktree_remove: None,
+            worktree_directory,
+            collapsed_space_keys,
             request_complete_onboarding: false,
             name_input: String::new(),
             name_input_replace_on_type: false,
@@ -424,6 +444,7 @@ impl App {
             sidebar_section_split,
             agent_panel_scope,
             mouse_capture: config.ui.mouse_capture,
+            mouse_scroll_lines: config.ui.mouse_scroll_lines(),
             confirm_close: config.ui.confirm_close,
             prompt_new_tab_name: config.ui.prompt_new_tab_name,
             show_agent_labels_on_pane_borders: config.ui.show_agent_labels_on_pane_borders,
@@ -458,14 +479,14 @@ impl App {
             goto: state::GotoState::default(),
             host_terminal_theme: crate::terminal_theme::TerminalTheme::default(),
             session_dirty: false,
+            terminal_runtime_shutdowns: Vec::new(),
         };
 
         state.terminals = restored_terminals;
-        state.terminal_runtimes = restored_terminal_runtimes;
 
         for ws_idx in 0..state.workspaces.len() {
             let cwd = state.workspaces[ws_idx]
-                .resolved_identity_cwd_from(&state.terminals, &state.terminal_runtimes);
+                .resolved_identity_cwd_from(&state.terminals, &restored_terminal_runtimes);
             state.workspaces[ws_idx].cached_git_branch =
                 cwd.as_deref().and_then(crate::workspace::git_branch);
         }
@@ -489,6 +510,7 @@ impl App {
             config_diagnostic_deadline: None,
             toast_deadline: None,
             state,
+            terminal_runtimes: restored_terminal_runtimes,
             event_tx,
             event_rx,
             last_git_remote_status_refresh: Instant::now() - GIT_REMOTE_STATUS_REFRESH_INTERVAL,
@@ -568,6 +590,47 @@ impl App {
                 needs_render = true;
             }
 
+            if let Some(ws_idx) = self.state.request_new_linked_worktree.take() {
+                self.open_new_linked_worktree_dialog(ws_idx);
+                needs_render = true;
+            }
+
+            if let Some(ws_idx) = self.state.request_open_existing_worktree.take() {
+                self.open_existing_worktree_dialog(ws_idx);
+                needs_render = true;
+            }
+
+            if let Some(cwd) = self.state.request_new_workspace_cwd.take() {
+                if let Err(err) = self.create_workspace_with_options(cwd, true) {
+                    tracing::error!(err = %err, "failed to create workspace at requested cwd");
+                    self.state.mode = Mode::Navigate;
+                }
+                needs_render = true;
+            }
+
+            if let Some(ws_idx) = self.state.request_remove_linked_worktree.take() {
+                self.open_remove_linked_worktree_confirmation(ws_idx);
+                needs_render = true;
+            }
+
+            if self.state.request_submit_worktree_create {
+                self.state.request_submit_worktree_create = false;
+                self.start_worktree_add();
+                needs_render = true;
+            }
+
+            if self.state.request_submit_worktree_open {
+                self.state.request_submit_worktree_open = false;
+                self.open_selected_existing_worktree();
+                needs_render = true;
+            }
+
+            if self.state.request_submit_worktree_remove {
+                self.state.request_submit_worktree_remove = false;
+                self.start_worktree_remove();
+                needs_render = true;
+            }
+
             if self.state.request_reload_config {
                 self.state.request_reload_config = false;
                 self.reload_config();
@@ -594,14 +657,31 @@ impl App {
                     let area = frame.area();
                     if kitty_graphics_enabled {
                         cell_size = crate::kitty_graphics::HostCellSize::from_terminal(area);
-                        crate::ui::compute_view_with_cell_size(&mut self.state, area, cell_size);
+                        crate::ui::compute_view_with_cell_size(
+                            &mut self.state,
+                            &self.terminal_runtimes,
+                            area,
+                            cell_size,
+                        );
                     } else {
-                        crate::ui::compute_view(&mut self.state, area);
+                        crate::ui::compute_view_with_runtime_registry(
+                            &mut self.state,
+                            &self.terminal_runtimes,
+                            area,
+                        );
                     }
-                    crate::ui::render(&self.state, frame);
+                    crate::ui::render_with_runtime_registry(
+                        &self.state,
+                        &self.terminal_runtimes,
+                        frame,
+                    );
                 })?;
                 if kitty_graphics_enabled {
-                    crate::kitty_graphics::paint_local_pane_graphics(&self.state, cell_size)?;
+                    crate::kitty_graphics::paint_local_pane_graphics(
+                        &self.state,
+                        &self.terminal_runtimes,
+                        cell_size,
+                    )?;
                 }
                 self.last_render_at = Some(now);
                 needs_render = false;
@@ -665,7 +745,9 @@ impl App {
     }
 
     fn sync_host_mouse_capture(&self, active: &mut bool) -> io::Result<()> {
-        let desired = self.state.should_capture_host_mouse();
+        let desired = self
+            .state
+            .should_capture_host_mouse_from(&self.terminal_runtimes);
         if desired == *active {
             return Ok(());
         }
@@ -884,6 +966,7 @@ impl App {
                     .sidebar_width
                     .clamp(self.state.sidebar_min_width, self.state.sidebar_max_width);
                 self.state.mouse_capture = config.ui.mouse_capture;
+                self.state.mouse_scroll_lines = config.ui.mouse_scroll_lines();
                 self.state.confirm_close = config.ui.confirm_close;
                 self.state.prompt_new_tab_name = config.ui.prompt_new_tab_name;
                 self.state.show_agent_labels_on_pane_borders =
@@ -922,6 +1005,11 @@ impl App {
 
         if !invalid_section("terminal") {
             self.state.default_shell = config.terminal.default_shell.clone();
+        }
+
+        if !invalid_section("worktrees") {
+            self.state.worktree_directory =
+                crate::worktree::expand_tilde_path(&config.worktrees.directory);
         }
 
         if !invalid_section("theme") {
@@ -1025,7 +1113,8 @@ impl App {
                     if self.state.mouse_capture {
                         self.handle_mouse_event_headless(mouse);
                     } else {
-                        self.state.handle_pane_mouse_only(mouse);
+                        self.state
+                            .handle_pane_mouse_only(&self.terminal_runtimes, mouse);
                     }
                 }
                 crate::raw_input::RawInputEvent::Paste(text) => {
@@ -1033,9 +1122,11 @@ impl App {
                         if let Some(ws_idx) = self.state.active {
                             if let Some(ws) = self.state.workspaces.get(ws_idx) {
                                 if let Some(focused) = ws.focused_pane_id() {
-                                    if let Some(runtime) =
-                                        self.state.runtime_for_pane_in_workspace(ws_idx, focused)
-                                    {
+                                    if let Some(runtime) = self.state.runtime_for_pane_in_workspace(
+                                        &self.terminal_runtimes,
+                                        ws_idx,
+                                        focused,
+                                    ) {
                                         let _ = runtime.try_send_bytes(bytes::Bytes::from(
                                             if runtime
                                                 .input_state()
@@ -1081,6 +1172,15 @@ impl App {
             Mode::RenameWorkspace | Mode::RenameTab | Mode::RenamePane => {
                 input::handle_rename_key(&mut self.state, key_event);
             }
+            Mode::NewLinkedWorktree => {
+                self.handle_worktree_create_key(key_event);
+            }
+            Mode::OpenExistingWorktree => {
+                self.handle_worktree_open_key(key_event);
+            }
+            Mode::ConfirmRemoveWorktree => {
+                self.handle_worktree_remove_key(key_event);
+            }
             Mode::Resize => {
                 input::handle_resize_key(&mut self.state, key);
             }
@@ -1088,7 +1188,11 @@ impl App {
                 input::handle_confirm_close_key(&mut self.state, key_event);
             }
             Mode::ContextMenu => {
-                input::handle_context_menu_key(&mut self.state, key_event);
+                input::handle_context_menu_key(
+                    &mut self.state,
+                    &mut self.terminal_runtimes,
+                    key_event,
+                );
             }
             Mode::KeybindHelp => {
                 input::handle_keybind_help_key(&mut self.state, key_event);
@@ -1230,6 +1334,7 @@ mod tests {
                 resolved_identity_cwd,
                 branch: Some("render-dirty-test".into()),
                 ahead_behind: Some((1, 0)),
+                space: None,
             }],
         });
 
@@ -2225,7 +2330,7 @@ mod tests {
             3
         );
 
-        let runtimes: Vec<_> = app.state.terminal_runtimes.drain().collect();
+        let runtimes: Vec<_> = app.terminal_runtimes.drain().collect();
         for (_terminal_id, runtime) in runtimes {
             runtime.shutdown();
         }
@@ -2272,7 +2377,7 @@ mod tests {
         assert_eq!(app.state.active, Some(0));
         assert_eq!(app.state.workspaces[0].active_tab, background_tab);
 
-        let runtimes: Vec<_> = app.state.terminal_runtimes.drain().collect();
+        let runtimes: Vec<_> = app.terminal_runtimes.drain().collect();
         for (_terminal_id, runtime) in runtimes {
             runtime.shutdown();
         }
@@ -2465,6 +2570,11 @@ mod tests {
             pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Working,
+            visible_blocker: false,
+            visible_idle: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
         });
         assert_eq!(
             app.state.terminals.get(&terminal_id).unwrap().state,
@@ -2485,6 +2595,11 @@ mod tests {
             pane_id,
             agent: Some(Agent::Pi),
             state: AgentState::Idle,
+            visible_blocker: false,
+            visible_idle: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: std::time::Instant::now(),
         });
         tokio::pin!(send);
 

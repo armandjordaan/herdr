@@ -28,12 +28,13 @@ impl App {
             let snap = crate::persist::capture(
                 &self.state.workspaces,
                 &self.state.terminals,
-                &self.state.terminal_runtimes,
+                &self.terminal_runtimes,
                 self.state.active,
                 self.state.selected,
                 self.state.agent_panel_scope,
                 self.state.sidebar_width,
                 self.state.sidebar_section_split,
+                self.state.collapsed_space_keys.clone(),
             );
             crate::persist::save(&snap);
         }

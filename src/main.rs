@@ -36,6 +36,7 @@ mod pane;
 mod persist;
 mod platform;
 mod product_announcements;
+mod protocol;
 mod raw_input;
 mod release_notes;
 mod remote;
@@ -49,6 +50,7 @@ mod terminal_theme;
 mod ui;
 mod update;
 mod workspace;
+mod worktree;
 
 fn init_logging() {
     crate::logging::init_file_logging("herdr.log");
@@ -99,6 +101,9 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # open_notification_target = "prefix+o"
 # workspace_picker = "prefix+w"
 # new_workspace = "prefix+shift+n"
+# new_worktree = "prefix+shift+g"
+# open_worktree = ""    # optional, unset by default
+# remove_worktree = ""  # optional, unset by default; opens confirmation
 # rename_workspace = "prefix+shift+w"
 # close_workspace = "prefix+shift+d"
 # previous_workspace = "" # optional, unset by default
@@ -143,6 +148,9 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # workspaces = "" # e.g. "ctrl+shift" makes ctrl+shift+1..9 switch workspaces directly
 # agents = ""     # e.g. "alt" makes alt+1..9 focus agent rows directly
 
+# [worktrees]
+# directory = "~/.herdr/worktrees"
+
 [ui]
 # Sidebar width (auto-scaled based on workspace names, this sets the default)
 # sidebar_width = 26
@@ -157,6 +165,9 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Set false to let the terminal handle normal clicks, such as Cmd-clicking URLs.
 # Pane apps like lazygit and btop can still receive mouse when they request it.
 # mouse_capture = true
+
+# Pane scrollback lines to scroll per mouse wheel notch.
+# mouse_scroll_lines = 3
 
 # Ask for confirmation before closing a workspace
 # confirm_close = true

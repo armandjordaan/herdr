@@ -5,6 +5,7 @@ use ratatui::layout::Direction;
 use serde::{Deserialize, Serialize};
 
 use crate::layout::Node;
+use crate::terminal::TerminalRuntimeRegistry;
 use crate::workspace::Workspace;
 
 /// Current snapshot format version.
@@ -25,6 +26,8 @@ pub struct SessionSnapshot {
     pub sidebar_width: Option<u16>,
     #[serde(default)]
     pub sidebar_section_split: Option<f32>,
+    #[serde(default)]
+    pub collapsed_space_keys: std::collections::HashSet<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -34,6 +37,8 @@ pub struct WorkspaceSnapshot {
     #[serde(default)]
     pub custom_name: Option<String>,
     pub identity_cwd: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_space: Option<crate::workspace::WorktreeSpaceMembership>,
     pub tabs: Vec<TabSnapshot>,
     #[serde(default)]
     pub active_tab: usize,
@@ -108,6 +113,7 @@ impl From<LegacyWorkspaceSnapshot> for WorkspaceSnapshot {
             id: None,
             custom_name: snap.custom_name,
             identity_cwd,
+            worktree_space: None,
             tabs: vec![tab],
             active_tab: 0,
         }
@@ -130,6 +136,8 @@ struct RawSessionSnapshot {
     sidebar_width: Option<u16>,
     #[serde(default)]
     sidebar_section_split: Option<f32>,
+    #[serde(default)]
+    collapsed_space_keys: std::collections::HashSet<String>,
 }
 
 fn migrate_snapshot(raw: RawSessionSnapshot) -> Result<SessionSnapshot, String> {
@@ -145,6 +153,7 @@ fn migrate_snapshot(raw: RawSessionSnapshot) -> Result<SessionSnapshot, String> 
         agent_panel_scope: raw.agent_panel_scope,
         sidebar_width: raw.sidebar_width,
         sidebar_section_split: raw.sidebar_section_split,
+        collapsed_space_keys: raw.collapsed_space_keys,
     })
 }
 
@@ -201,15 +210,13 @@ pub fn capture(
         crate::terminal::TerminalId,
         crate::terminal::TerminalState,
     >,
-    terminal_runtimes: &std::collections::HashMap<
-        crate::terminal::TerminalId,
-        crate::terminal::TerminalRuntime,
-    >,
+    terminal_runtimes: &TerminalRuntimeRegistry,
     active: Option<usize>,
     selected: usize,
     agent_panel_scope: crate::app::state::AgentPanelScope,
     sidebar_width: u16,
     sidebar_section_split: f32,
+    collapsed_space_keys: std::collections::HashSet<String>,
 ) -> SessionSnapshot {
     SessionSnapshot {
         version: SNAPSHOT_VERSION,
@@ -222,6 +229,7 @@ pub fn capture(
         agent_panel_scope,
         sidebar_width: Some(sidebar_width),
         sidebar_section_split: Some(sidebar_section_split),
+        collapsed_space_keys,
     }
 }
 
@@ -231,10 +239,7 @@ fn capture_workspace(
         crate::terminal::TerminalId,
         crate::terminal::TerminalState,
     >,
-    terminal_runtimes: &std::collections::HashMap<
-        crate::terminal::TerminalId,
-        crate::terminal::TerminalRuntime,
-    >,
+    terminal_runtimes: &TerminalRuntimeRegistry,
 ) -> WorkspaceSnapshot {
     WorkspaceSnapshot {
         id: Some(ws.id.clone()),
@@ -242,6 +247,7 @@ fn capture_workspace(
         identity_cwd: ws
             .resolved_identity_cwd_from(terminals, terminal_runtimes)
             .unwrap_or_else(|| ws.identity_cwd.clone()),
+        worktree_space: ws.worktree_space.clone(),
         tabs: ws
             .tabs
             .iter()
@@ -257,10 +263,7 @@ fn capture_tab(
         crate::terminal::TerminalId,
         crate::terminal::TerminalState,
     >,
-    terminal_runtimes: &std::collections::HashMap<
-        crate::terminal::TerminalId,
-        crate::terminal::TerminalRuntime,
-    >,
+    terminal_runtimes: &TerminalRuntimeRegistry,
 ) -> TabSnapshot {
     let mut panes = HashMap::new();
     for id in tab.panes.keys() {
@@ -373,15 +376,17 @@ mod tests {
     }
 
     fn capture_from_state(state: &AppState) -> SessionSnapshot {
+        let terminal_runtimes = TerminalRuntimeRegistry::new();
         capture(
             &state.workspaces,
             &state.terminals,
-            &state.terminal_runtimes,
+            &terminal_runtimes,
             state.active,
             state.selected,
             state.agent_panel_scope,
             state.sidebar_width,
             state.sidebar_section_split,
+            state.collapsed_space_keys.clone(),
         )
     }
 
@@ -402,6 +407,7 @@ mod tests {
             agent_panel_scope: AgentPanelScope::CurrentWorkspace,
             sidebar_width: Some(26),
             sidebar_section_split: Some(0.5),
+            collapsed_space_keys: std::collections::HashSet::new(),
         };
         let json = serde_json::to_string(&snap).unwrap();
         let restored = parse_snapshot(&json).unwrap();
@@ -458,6 +464,7 @@ mod tests {
                 id: Some("wproj".to_string()),
                 custom_name: Some("pi-mono".to_string()),
                 identity_cwd: PathBuf::from("/home/can/Projects/herdr"),
+                worktree_space: None,
                 tabs: vec![TabSnapshot {
                     custom_name: Some("api".to_string()),
                     layout: LayoutSnapshot::Split {
@@ -478,6 +485,7 @@ mod tests {
             agent_panel_scope: AgentPanelScope::CurrentWorkspace,
             sidebar_width: Some(26),
             sidebar_section_split: Some(0.5),
+            collapsed_space_keys: std::collections::HashSet::new(),
             version: SNAPSHOT_VERSION,
         };
 
@@ -629,11 +637,32 @@ mod tests {
         state.sidebar_width = 31;
         state.sidebar_section_split = 0.4;
         state.agent_panel_scope = AgentPanelScope::AllWorkspaces;
+        state.collapsed_space_keys.insert("repo-key".into());
 
         let snapshot = capture_from_state(&state);
         assert_eq!(snapshot.sidebar_width, Some(31));
         assert_eq!(snapshot.sidebar_section_split, Some(0.4));
         assert_eq!(snapshot.agent_panel_scope, AgentPanelScope::AllWorkspaces);
+        assert!(snapshot.collapsed_space_keys.contains("repo-key"));
+    }
+
+    #[test]
+    fn capture_contract_tracks_worktree_space_membership() {
+        let mut state = state_with_workspaces(&["main"]);
+        state.workspaces[0].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "herdr".into(),
+            repo_root: PathBuf::from("/repo/herdr"),
+            checkout_path: PathBuf::from("/repo/herdr/worktree-a"),
+            is_linked_worktree: true,
+        });
+
+        let snapshot = capture_from_state(&state);
+
+        assert_eq!(
+            snapshot.workspaces[0].worktree_space,
+            state.workspaces[0].worktree_space
+        );
     }
 
     #[test]
@@ -783,6 +812,7 @@ mod tests {
                 id: Some("test-ws".to_string()),
                 custom_name: Some("fallback test".to_string()),
                 identity_cwd: PathBuf::from("/tmp"),
+                worktree_space: None,
                 tabs: vec![TabSnapshot {
                     custom_name: None,
                     layout: LayoutSnapshot::Split {
@@ -803,6 +833,7 @@ mod tests {
             agent_panel_scope: AgentPanelScope::CurrentWorkspace,
             sidebar_width: Some(26),
             sidebar_section_split: Some(0.5),
+            collapsed_space_keys: std::collections::HashSet::new(),
         };
 
         let json = serde_json::to_string(&snap).unwrap();

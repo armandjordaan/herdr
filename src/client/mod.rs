@@ -12,7 +12,6 @@
 //! - Forwards OSC 52 clipboard writes from server to its own stdout
 //! - Displays sound/toast notifications forwarded from server
 
-pub(crate) mod blit;
 mod input;
 
 use std::collections::HashSet;
@@ -30,11 +29,12 @@ use crossterm::event::{
 use crossterm::execute;
 use tracing::{debug, info, warn};
 
-use crate::server::headless::client_socket_path;
-use crate::server::protocol::{
+use crate::protocol::render_ansi;
+use crate::protocol::{
     self, ClientKeybindings, ClientMessage, NotifyKind, RenderEncoding, ServerMessage,
     MAX_CLIPBOARD_IMAGE_PAYLOAD, MAX_FRAME_SIZE, MAX_GRAPHICS_FRAME_SIZE, PROTOCOL_VERSION,
 };
+use crate::server::socket_paths::client_socket_path;
 
 static RECEIVED_KITTY_GRAPHICS_IDS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
 
@@ -45,7 +45,7 @@ static RECEIVED_KITTY_GRAPHICS_IDS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::ne
 /// State tracking for the thin client.
 struct ClientState {
     /// Stateful semantic-frame encoder used when the server sends FrameData.
-    blit_encoder: blit::BlitEncoder,
+    blit_encoder: render_ansi::BlitEncoder,
     /// Whether host mouse capture is currently active.
     mouse_capture_active: bool,
     /// The terminal size we reported to the server in our last Hello/Resize.
@@ -106,7 +106,7 @@ impl AttachEscapeState {
 
 impl ClientState {
     fn request_full_redraw(&mut self) {
-        self.blit_encoder = blit::BlitEncoder::new();
+        self.blit_encoder = render_ansi::BlitEncoder::new();
     }
 }
 
@@ -154,7 +154,11 @@ impl std::fmt::Display for ClientError {
                             write!(f, "\nRun `{reattach_command}` to reattach")?;
                         } else {
                             write!(f, "detached from server")?;
-                            write!(f, "\nRun `herdr` to reattach")?;
+                            write!(
+                                f,
+                                "\nRun `{}` to reattach",
+                                crate::session::local_attach_command()
+                            )?;
                         }
                     }
                     _ => {
@@ -574,7 +578,7 @@ async fn run_client_loop(
     attach_escape: Option<AttachEscapeState>,
 ) -> Result<(), ClientError> {
     let mut state = ClientState {
-        blit_encoder: blit::BlitEncoder::new(),
+        blit_encoder: render_ansi::BlitEncoder::new(),
         mouse_capture_active,
         reported_size: (cols, rows),
         sound_config,
@@ -1125,6 +1129,65 @@ fn init_logging() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn restore_env_var(key: &str, value: Option<OsString>) {
+        if let Some(value) = value {
+            std::env::set_var(key, value);
+        } else {
+            std::env::remove_var(key);
+        }
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            restore_env_var(self.key, self.previous.clone());
+        }
+    }
+
+    struct EnvVarsRemovedGuard {
+        previous: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl EnvVarsRemovedGuard {
+        fn new(keys: &[&'static str]) -> Self {
+            let previous: Vec<_> = keys
+                .iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect();
+            for key in keys {
+                std::env::remove_var(key);
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for EnvVarsRemovedGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.previous.clone() {
+                restore_env_var(key, value);
+            }
+        }
+    }
 
     #[test]
     fn clipboard_image_paste_bridge_triggers_on_ctrl_v_and_empty_paste() {
@@ -1292,6 +1355,56 @@ mod tests {
         assert!(
             msg.contains("server shut down"),
             "should mention shutdown: {msg}"
+        );
+    }
+
+    #[test]
+    fn client_error_display_detached_default_session_reattach_hint() {
+        let _guard = env_lock().lock().unwrap();
+        let _env = EnvVarsRemovedGuard::new(&[
+            crate::remote::REATTACH_COMMAND_ENV_VAR,
+            crate::session::SESSION_ENV_VAR,
+        ]);
+        let err = ClientError::ServerShutdown {
+            reason: Some("detached".into()),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Run `herdr` to reattach"),
+            "should suggest default reattach command: {msg}"
+        );
+    }
+
+    #[test]
+    fn client_error_display_detached_named_session_reattach_hint() {
+        let _guard = env_lock().lock().unwrap();
+        let _remote_env = EnvVarsRemovedGuard::new(&[crate::remote::REATTACH_COMMAND_ENV_VAR]);
+        let _session_env = EnvVarGuard::set(crate::session::SESSION_ENV_VAR, "work");
+        let err = ClientError::ServerShutdown {
+            reason: Some("detached".into()),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Run `herdr session attach work` to reattach"),
+            "should suggest named session reattach command: {msg}"
+        );
+    }
+
+    #[test]
+    fn client_error_display_detached_remote_reattach_hint_takes_precedence() {
+        let _guard = env_lock().lock().unwrap();
+        let _remote_env = EnvVarGuard::set(
+            crate::remote::REATTACH_COMMAND_ENV_VAR,
+            "herdr --remote host --session work",
+        );
+        let _session_env = EnvVarGuard::set(crate::session::SESSION_ENV_VAR, "work");
+        let err = ClientError::ServerShutdown {
+            reason: Some("detached".into()),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Run `herdr --remote host --session work` to reattach"),
+            "should prefer remote reattach command: {msg}"
         );
     }
 

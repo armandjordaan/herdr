@@ -1,7 +1,10 @@
+use std::num::NonZeroUsize;
+
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::{
-    BindingConfig, CommandKeybindConfig, SoundConfig, ThemeConfig, DEFAULT_SCROLLBACK_LIMIT_BYTES,
+    BindingConfig, CommandKeybindConfig, SoundConfig, ThemeConfig, DEFAULT_MOUSE_SCROLL_LINES,
+    DEFAULT_SCROLLBACK_LIMIT_BYTES,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -78,6 +81,7 @@ pub struct Config {
     pub terminal: TerminalConfig,
     pub keys: KeysConfig,
     pub ui: UiConfig,
+    pub worktrees: WorktreesConfig,
     pub advanced: AdvancedConfig,
     pub experimental: ExperimentalConfig,
 }
@@ -100,6 +104,12 @@ pub struct KeysConfig {
     pub settings: BindingConfig,
     /// Create a new workspace. Default: "prefix+shift+n"
     pub new_workspace: BindingConfig,
+    /// Create a Git worktree from the selected workspace. Default: "prefix+shift+g"
+    pub new_worktree: BindingConfig,
+    /// Open an existing Git worktree from the selected workspace. Unset by default.
+    pub open_worktree: BindingConfig,
+    /// Delete the selected managed worktree checkout after confirmation. Unset by default.
+    pub remove_worktree: BindingConfig,
     /// Rename the selected workspace. Default: "prefix+shift+w"
     pub rename_workspace: BindingConfig,
     /// Close the selected workspace. Default: "prefix+shift+d"
@@ -189,6 +199,13 @@ pub struct IndexedKeysConfig {
 
 #[derive(Debug, Deserialize)]
 #[serde(default)]
+pub struct WorktreesConfig {
+    /// Root directory under which Herdr creates <repo>/<branch-slug> checkouts.
+    pub directory: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
 pub struct UiConfig {
     pub sidebar_width: u16,
     /// Minimum sidebar width (columns) when expanded. Default: 18.
@@ -197,6 +214,8 @@ pub struct UiConfig {
     pub sidebar_max_width: u16,
     /// Capture mouse input for Herdr's mouse UI. Default: true.
     pub mouse_capture: bool,
+    /// Lines to scroll per mouse wheel notch. Default: 3.
+    pub mouse_scroll_lines: Option<NonZeroUsize>,
     /// Ask for confirmation before closing a workspace. Default: true.
     pub confirm_close: bool,
     /// Ask for a tab name before creating a new tab. Default: true.
@@ -287,6 +306,9 @@ impl Default for KeysConfig {
             help: BindingConfig::one("prefix+?"),
             settings: BindingConfig::one("prefix+s"),
             new_workspace: BindingConfig::one("prefix+shift+n"),
+            new_worktree: BindingConfig::one("prefix+shift+g"),
+            open_worktree: BindingConfig::empty(),
+            remove_worktree: BindingConfig::empty(),
             rename_workspace: BindingConfig::one("prefix+shift+w"),
             close_workspace: BindingConfig::one("prefix+shift+d"),
             workspace_picker: BindingConfig::one("prefix+w"),
@@ -327,6 +349,14 @@ impl Default for KeysConfig {
     }
 }
 
+impl Default for WorktreesConfig {
+    fn default() -> Self {
+        Self {
+            directory: "~/.herdr/worktrees".into(),
+        }
+    }
+}
+
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
@@ -334,6 +364,7 @@ impl Default for UiConfig {
             sidebar_min_width: 18,
             sidebar_max_width: 36,
             mouse_capture: true,
+            mouse_scroll_lines: None,
             confirm_close: true,
             prompt_new_tab_name: true,
             show_agent_labels_on_pane_borders: false,
@@ -342,6 +373,14 @@ impl Default for UiConfig {
             toast: ToastConfig::default(),
             sound: SoundConfig::default(),
         }
+    }
+}
+
+impl UiConfig {
+    pub fn mouse_scroll_lines(&self) -> usize {
+        self.mouse_scroll_lines
+            .map(NonZeroUsize::get)
+            .unwrap_or(DEFAULT_MOUSE_SCROLL_LINES)
     }
 }
 
@@ -421,6 +460,19 @@ show_agent_labels_on_pane_borders = true
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(config.ui.show_agent_labels_on_pane_borders);
+    }
+
+    #[test]
+    fn worktrees_directory_defaults_and_parses() {
+        let default_config = Config::default();
+        assert_eq!(default_config.worktrees.directory, "~/.herdr/worktrees");
+
+        let toml = r#"
+[worktrees]
+directory = "~/Projects/herdr-worktrees"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.worktrees.directory, "~/Projects/herdr-worktrees");
     }
 
     #[test]
@@ -520,6 +572,31 @@ mouse_capture = false
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(!config.ui.mouse_capture);
+    }
+
+    #[test]
+    fn mouse_scroll_lines_defaults_to_three_and_parses() {
+        let default_config = Config::default();
+        assert_eq!(
+            default_config.ui.mouse_scroll_lines(),
+            DEFAULT_MOUSE_SCROLL_LINES
+        );
+
+        let toml = r#"
+[ui]
+mouse_scroll_lines = 1
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.ui.mouse_scroll_lines(), 1);
+    }
+
+    #[test]
+    fn mouse_scroll_lines_rejects_zero() {
+        let toml = r#"
+[ui]
+mouse_scroll_lines = 0
+"#;
+        assert!(toml::from_str::<Config>(toml).is_err());
     }
 
     #[test]

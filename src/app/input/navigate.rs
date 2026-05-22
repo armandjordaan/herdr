@@ -16,6 +16,7 @@ use crate::{
     },
     input::TerminalKey,
     layout::NavDirection,
+    terminal::TerminalRuntimeRegistry,
 };
 
 pub(crate) fn terminal_direct_navigation_action(
@@ -55,7 +56,12 @@ impl App {
                 self.launch_focused_scrollback_editor();
                 finish_action_context(&mut self.state, ActionContext::Prefix, previous_mode);
             } else {
-                execute_navigate_action_in_context(&mut self.state, action, ActionContext::Prefix);
+                execute_navigate_action_in_context(
+                    &mut self.state,
+                    &mut self.terminal_runtimes,
+                    action,
+                    ActionContext::Prefix,
+                );
             }
             self.selection_autoscroll_deadline = None;
             return;
@@ -88,6 +94,7 @@ impl App {
             } else {
                 execute_navigate_action_in_context(
                     &mut self.state,
+                    &mut self.terminal_runtimes,
                     action,
                     ActionContext::Navigate,
                 );
@@ -105,7 +112,10 @@ impl App {
         let Some(ws_idx) = self.state.active else {
             return false;
         };
-        let Some(rt) = self.state.focused_runtime_in_workspace(ws_idx) else {
+        let Some(rt) = self
+            .state
+            .focused_runtime_in_workspace(&self.terminal_runtimes, ws_idx)
+        else {
             return false;
         };
 
@@ -174,11 +184,7 @@ impl App {
                         env.push(("HERDR_ACTIVE_PANE_ID".to_string(), public_pane_id));
                     }
                     if let Some(pane_cwd) = workspace.active_tab().and_then(|tab| {
-                        tab.cwd_for_pane(
-                            pane_id,
-                            &self.state.terminals,
-                            &self.state.terminal_runtimes,
-                        )
+                        tab.cwd_for_pane(pane_id, &self.state.terminals, &self.terminal_runtimes)
                     }) {
                         env.push((
                             "HERDR_ACTIVE_PANE_CWD".to_string(),
@@ -245,7 +251,7 @@ impl App {
             .ok_or_else(|| std::io::Error::other("no focused pane"))?;
         let scrollback = self
             .state
-            .runtime_for_pane_in_workspace(ws_idx, pane_id)
+            .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
             .ok_or_else(|| std::io::Error::other("focused pane has no scrollback runtime"))?
             .recent_text(usize::MAX);
 
@@ -298,7 +304,7 @@ impl App {
             tab.cwd_for_pane(
                 previous_focus,
                 &self.state.terminals,
-                &self.state.terminal_runtimes,
+                &self.terminal_runtimes,
             )
         });
         let new_pane = ws.split_focused_command(
@@ -312,8 +318,7 @@ impl App {
             self.state.host_terminal_theme,
         )?;
         let new_pane_id = new_pane.pane_id;
-        self.state
-            .terminal_runtimes
+        self.terminal_runtimes
             .insert(new_pane.terminal.id.clone(), new_pane.runtime);
         self.state
             .terminals
@@ -378,24 +383,18 @@ pub(super) fn handle_navigate_reserved_key(state: &mut AppState, key: KeyEvent) 
         }
         KeyCode::Char(c @ '1'..='9') => {
             let idx = (c as usize) - ('1' as usize);
-            if idx < state.workspaces.len() {
-                state.switch_workspace(idx);
+            if let Some(ws_idx) = state.workspace_at_visible_position(idx) {
+                state.switch_workspace(ws_idx);
                 leave_navigate_mode(state);
             }
             true
         }
         KeyCode::Up => {
-            if state.selected > 0 {
-                state.selected -= 1;
-                state.ensure_workspace_visible(state.selected);
-            }
+            state.move_selected_workspace_by_visible_delta(-1);
             true
         }
         KeyCode::Down => {
-            if !state.workspaces.is_empty() && state.selected < state.workspaces.len() - 1 {
-                state.selected += 1;
-                state.ensure_workspace_visible(state.selected);
-            }
+            state.move_selected_workspace_by_visible_delta(1);
             true
         }
         KeyCode::Char('h') | KeyCode::Left => {
@@ -428,6 +427,7 @@ pub(super) fn handle_navigate_reserved_key(state: &mut AppState, key: KeyEvent) 
 
 #[allow(dead_code)] // exercised in input unit tests; production uses App::handle_navigate_key
 pub(crate) fn handle_navigate_key(state: &mut AppState, key: KeyEvent) {
+    let mut terminal_runtimes = TerminalRuntimeRegistry::new();
     state.update_dismissed = true;
     let terminal_key = TerminalKey::from(key);
 
@@ -441,13 +441,21 @@ pub(crate) fn handle_navigate_key(state: &mut AppState, key: KeyEvent) {
     }
 
     if let Some(action) = action_for_key(state, terminal_key, BindingDispatch::Prefix) {
-        execute_navigate_action_in_context(state, action, ActionContext::Navigate);
+        execute_navigate_action_in_context(
+            state,
+            &mut terminal_runtimes,
+            action,
+            ActionContext::Navigate,
+        );
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NavigateAction {
     NewWorkspace,
+    NewWorktree,
+    OpenWorktree,
+    RemoveWorktree,
     RenameWorkspace,
     CloseWorkspace,
     SwitchWorkspace(usize),
@@ -548,6 +556,9 @@ fn action_for_key(
         (&kb.settings, NavigateAction::Settings),
         (&kb.workspace_picker, NavigateAction::WorkspacePicker),
         (&kb.new_workspace, NavigateAction::NewWorkspace),
+        (&kb.new_worktree, NavigateAction::NewWorktree),
+        (&kb.open_worktree, NavigateAction::OpenWorktree),
+        (&kb.remove_worktree, NavigateAction::RemoveWorktree),
         (&kb.rename_workspace, NavigateAction::RenameWorkspace),
         (&kb.close_workspace, NavigateAction::CloseWorkspace),
         (&kb.previous_workspace, NavigateAction::PreviousWorkspace),
@@ -591,11 +602,18 @@ fn action_for_key(
 
 #[cfg(test)]
 pub(super) fn execute_navigate_action(state: &mut AppState, action: NavigateAction) {
-    execute_navigate_action_in_context(state, action, ActionContext::Navigate);
+    let mut terminal_runtimes = TerminalRuntimeRegistry::new();
+    execute_navigate_action_in_context(
+        state,
+        &mut terminal_runtimes,
+        action,
+        ActionContext::Navigate,
+    );
 }
 
 pub(super) fn execute_navigate_action_in_context(
     state: &mut AppState,
+    terminal_runtimes: &mut TerminalRuntimeRegistry,
     action: NavigateAction,
     context: ActionContext,
 ) {
@@ -605,13 +623,36 @@ pub(super) fn execute_navigate_action_in_context(
             state.request_new_workspace = true;
             leave_navigate_mode(state);
         }
+        NavigateAction::NewWorktree => {
+            if let Some(ws_idx) = workspace_action_target(state, context)
+                .filter(|idx| workspace_can_start_worktree_action(state, terminal_runtimes, *idx))
+            {
+                state.request_new_linked_worktree = Some(ws_idx);
+                leave_navigate_mode(state);
+            }
+        }
+        NavigateAction::OpenWorktree => {
+            if let Some(ws_idx) = workspace_action_target(state, context)
+                .filter(|idx| workspace_can_start_worktree_action(state, terminal_runtimes, *idx))
+            {
+                state.request_open_existing_worktree = Some(ws_idx);
+                leave_navigate_mode(state);
+            }
+        }
+        NavigateAction::RemoveWorktree => {
+            if let Some(ws_idx) = workspace_action_target(state, context) {
+                state.request_remove_linked_worktree = Some(ws_idx);
+                leave_navigate_mode(state);
+            }
+        }
         NavigateAction::RenameWorkspace => {
-            if !state.workspaces.is_empty() {
-                super::modal::open_rename_workspace(state, state.selected);
+            if let Some(ws_idx) = workspace_action_target(state, context) {
+                super::modal::open_rename_workspace(state, ws_idx);
             }
         }
         NavigateAction::CloseWorkspace => {
-            if !state.workspaces.is_empty() {
+            if let Some(ws_idx) = workspace_action_target(state, context) {
+                state.selected = ws_idx;
                 if state.confirm_close {
                     super::modal::open_confirm_close(state);
                 } else {
@@ -621,8 +662,8 @@ pub(super) fn execute_navigate_action_in_context(
             }
         }
         NavigateAction::SwitchWorkspace(idx) => {
-            if idx < state.workspaces.len() {
-                state.switch_workspace(idx);
+            if let Some(ws_idx) = state.workspace_at_visible_position(idx) {
+                state.switch_workspace(ws_idx);
                 leave_navigate_mode(state);
             }
         }
@@ -698,11 +739,11 @@ pub(super) fn execute_navigate_action_in_context(
         NavigateAction::FocusPaneUp => state.navigate_pane(NavDirection::Up),
         NavigateAction::FocusPaneRight => state.navigate_pane(NavDirection::Right),
         NavigateAction::SplitVertical => {
-            state.split_pane(Direction::Horizontal);
+            state.split_pane(terminal_runtimes, Direction::Horizontal);
             leave_navigate_mode(state);
         }
         NavigateAction::SplitHorizontal => {
-            state.split_pane(Direction::Vertical);
+            state.split_pane(terminal_runtimes, Direction::Vertical);
             leave_navigate_mode(state);
         }
         NavigateAction::ClosePane => {
@@ -751,6 +792,36 @@ pub(super) fn execute_navigate_action_in_context(
     }
 
     finish_action_context(state, context, previous_mode);
+}
+
+fn workspace_action_target(state: &AppState, context: ActionContext) -> Option<usize> {
+    let idx = match context {
+        ActionContext::Direct | ActionContext::Prefix => state.active.unwrap_or(state.selected),
+        ActionContext::Navigate => state.selected,
+    };
+    (idx < state.workspaces.len()).then_some(idx)
+}
+
+fn workspace_can_start_worktree_action(
+    state: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    ws_idx: usize,
+) -> bool {
+    let Some(ws) = state.workspaces.get(ws_idx) else {
+        return false;
+    };
+    if ws
+        .worktree_space()
+        .is_some_and(|space| space.is_linked_worktree)
+    {
+        return false;
+    }
+    let git_space = ws.git_space().cloned().or_else(|| {
+        ws.resolved_identity_cwd_from(&state.terminals, terminal_runtimes)
+            .as_deref()
+            .and_then(crate::workspace::git_space_metadata)
+    });
+    !git_space.is_some_and(|space| space.is_linked_worktree)
 }
 
 fn leave_navigate_mode(state: &mut AppState) {
@@ -857,6 +928,16 @@ mod tests {
     use super::*;
     use crate::{app::App, config::Config, input::TerminalKey, workspace::Workspace};
 
+    fn mark_worktree_space_member(state: &mut AppState, ws_idx: usize, key: &str) {
+        state.workspaces[ws_idx].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: key.into(),
+            label: "herdr".into(),
+            repo_root: "/repo/herdr".into(),
+            checkout_path: format!("/repo/worktree-{ws_idx}").into(),
+            is_linked_worktree: ws_idx != 0,
+        });
+    }
+
     #[test]
     fn custom_rename_key_enters_rename_mode() {
         let mut state = state_with_workspaces(&["test"]);
@@ -872,6 +953,55 @@ mod tests {
     }
 
     #[test]
+    fn prefix_rename_workspace_targets_active_workspace_not_stale_selection() {
+        let mut state = state_with_workspaces(&["main", "issue"]);
+        let mut terminal_runtimes = TerminalRuntimeRegistry::new();
+        state.active = Some(1);
+        state.selected = 0;
+        state.mode = Mode::Prefix;
+
+        execute_navigate_action_in_context(
+            &mut state,
+            &mut terminal_runtimes,
+            NavigateAction::RenameWorkspace,
+            ActionContext::Prefix,
+        );
+
+        assert_eq!(state.mode, Mode::RenameWorkspace);
+        assert_eq!(state.selected, 1);
+        assert_eq!(state.name_input, "issue");
+    }
+
+    #[test]
+    fn prefix_close_workspace_targets_active_linked_worktree_without_removing_checkout() {
+        let mut state = state_with_workspaces(&["main", "issue"]);
+        let mut terminal_runtimes = TerminalRuntimeRegistry::new();
+        state.active = Some(1);
+        state.selected = 0;
+        state.mode = Mode::Prefix;
+        state.confirm_close = false;
+        state.workspaces[1].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "herdr".into(),
+            repo_root: "/repo/herdr".into(),
+            checkout_path: "/repo/herdr-issue".into(),
+            is_linked_worktree: true,
+        });
+
+        execute_navigate_action_in_context(
+            &mut state,
+            &mut terminal_runtimes,
+            NavigateAction::CloseWorkspace,
+            ActionContext::Prefix,
+        );
+
+        assert_eq!(state.request_remove_linked_worktree, None);
+        assert_eq!(state.workspaces.len(), 1);
+        assert_eq!(state.workspaces[0].display_name(), "main");
+        assert_eq!(state.mode, Mode::Terminal);
+    }
+
+    #[test]
     fn custom_new_workspace_key_requests_and_exits_navigate() {
         let mut state = state_with_workspaces(&["test"]);
         state.keybinds.new_workspace = crate::config::ActionKeybinds::prefix("g");
@@ -883,6 +1013,126 @@ mod tests {
 
         assert!(state.request_new_workspace);
         assert_eq!(state.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn custom_new_worktree_key_requests_selected_workspace() {
+        let mut state = state_with_workspaces(&["main", "scratch"]);
+        state.workspaces[1].identity_cwd = unique_temp_path("navigate-new-worktree-selected");
+        state.mode = Mode::Navigate;
+        state.selected = 1;
+        state.active = Some(0);
+        state.keybinds.new_worktree = crate::config::ActionKeybinds::prefix("g");
+
+        handle_navigate_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::empty()),
+        );
+
+        assert_eq!(state.request_new_linked_worktree, Some(1));
+        assert_eq!(state.mode, Mode::Terminal);
+    }
+
+    #[test]
+    fn worktree_actions_do_not_start_from_linked_child_workspace() {
+        let mut terminal_runtimes = TerminalRuntimeRegistry::new();
+        let mut state = state_with_workspaces(&["main", "issue"]);
+        mark_worktree_space_member(&mut state, 0, "repo-key");
+        mark_worktree_space_member(&mut state, 1, "repo-key");
+        state.mode = Mode::Navigate;
+        state.selected = 1;
+        state.active = Some(0);
+
+        execute_navigate_action_in_context(
+            &mut state,
+            &mut terminal_runtimes,
+            NavigateAction::NewWorktree,
+            ActionContext::Navigate,
+        );
+        assert_eq!(state.request_new_linked_worktree, None);
+
+        execute_navigate_action_in_context(
+            &mut state,
+            &mut terminal_runtimes,
+            NavigateAction::OpenWorktree,
+            ActionContext::Navigate,
+        );
+        assert_eq!(state.request_open_existing_worktree, None);
+    }
+
+    #[test]
+    fn direct_new_worktree_action_targets_active_workspace() {
+        let mut terminal_runtimes = TerminalRuntimeRegistry::new();
+        let mut state = state_with_workspaces(&["main", "scratch"]);
+        state.workspaces[0].identity_cwd = unique_temp_path("navigate-new-worktree-active");
+        state.mode = Mode::Terminal;
+        state.selected = 1;
+        state.active = Some(0);
+
+        execute_navigate_action_in_context(
+            &mut state,
+            &mut terminal_runtimes,
+            NavigateAction::NewWorktree,
+            ActionContext::Direct,
+        );
+
+        assert_eq!(state.request_new_linked_worktree, Some(0));
+    }
+
+    #[test]
+    fn navigate_down_follows_grouped_sidebar_visual_order() {
+        let mut state = state_with_workspaces(&["main", "normal", "issue"]);
+        mark_worktree_space_member(&mut state, 0, "repo-key");
+        mark_worktree_space_member(&mut state, 2, "repo-key");
+        state.mode = Mode::Navigate;
+        state.active = Some(0);
+        state.selected = 0;
+
+        handle_navigate_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+        );
+
+        assert_eq!(state.selected, 2);
+    }
+
+    #[test]
+    fn navigate_number_keys_follow_grouped_sidebar_visual_order() {
+        let mut state = state_with_workspaces(&["main", "normal", "issue"]);
+        mark_worktree_space_member(&mut state, 0, "repo-key");
+        mark_worktree_space_member(&mut state, 2, "repo-key");
+        state.mode = Mode::Navigate;
+        state.active = Some(0);
+        state.selected = 0;
+
+        handle_navigate_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('2'), KeyModifiers::empty()),
+        );
+
+        assert_eq!(state.active, Some(2));
+        assert_eq!(state.selected, 2);
+    }
+
+    #[test]
+    fn indexed_switch_workspace_keybind_follows_grouped_sidebar_visual_order() {
+        let mut state = state_with_workspaces(&["main", "normal", "issue"]);
+        let mut terminal_runtimes = TerminalRuntimeRegistry::new();
+        mark_worktree_space_member(&mut state, 0, "repo-key");
+        mark_worktree_space_member(&mut state, 2, "repo-key");
+        state.mode = Mode::Prefix;
+        state.active = Some(0);
+        state.selected = 0;
+
+        execute_navigate_action_in_context(
+            &mut state,
+            &mut terminal_runtimes,
+            NavigateAction::SwitchWorkspace(1),
+            ActionContext::Prefix,
+        );
+
+        assert_eq!(state.active, Some(2));
+        assert_eq!(state.selected, 2);
     }
 
     #[test]
@@ -1201,10 +1451,12 @@ mod tests {
     #[test]
     fn empty_state_new_tab_is_no_op() {
         let mut state = crate::app::state::AppState::test_new();
+        let mut terminal_runtimes = TerminalRuntimeRegistry::new();
         state.mode = Mode::Prefix;
 
         execute_navigate_action_in_context(
             &mut state,
+            &mut terminal_runtimes,
             NavigateAction::NewTab,
             ActionContext::Prefix,
         );
@@ -1213,6 +1465,29 @@ mod tests {
         assert!(!state.creating_new_tab);
         assert!(!state.request_new_tab);
         assert!(state.workspaces.is_empty());
+    }
+
+    #[test]
+    fn closing_linked_worktree_closes_workspace_without_removing_checkout() {
+        let mut state = state_with_workspaces(&["main", "issue"]);
+        state.selected = 1;
+        state.active = Some(1);
+        state.mode = Mode::Navigate;
+        state.confirm_close = false;
+        state.workspaces[1].worktree_space = Some(crate::workspace::WorktreeSpaceMembership {
+            key: "repo-key".into(),
+            label: "herdr".into(),
+            repo_root: "/repo/herdr".into(),
+            checkout_path: "/repo/herdr-issue".into(),
+            is_linked_worktree: true,
+        });
+
+        execute_navigate_action(&mut state, NavigateAction::CloseWorkspace);
+
+        assert_eq!(state.request_remove_linked_worktree, None);
+        assert_eq!(state.workspaces.len(), 1);
+        assert_eq!(state.workspaces[0].display_name(), "main");
+        assert_eq!(state.mode, Mode::Terminal);
     }
 
     #[tokio::test]
@@ -1286,9 +1561,7 @@ mod tests {
         )
         .expect("workspace should spawn");
         app.state.workspaces = vec![workspace];
-        app.state
-            .terminal_runtimes
-            .insert(terminal.id.clone(), runtime);
+        app.terminal_runtimes.insert(terminal.id.clone(), runtime);
         app.state.terminals.insert(terminal.id.clone(), terminal);
         app.state.active = Some(0);
         app.state.selected = 0;
@@ -1312,7 +1585,7 @@ mod tests {
             .await;
 
         assert_eq!(app.state.workspaces[0].tabs[0].layout.pane_count(), 2);
-        assert_eq!(app.state.terminal_runtimes.len(), 2);
+        assert_eq!(app.terminal_runtimes.len(), 2);
         assert!(app.state.workspaces[0].tabs[0].zoomed);
 
         let _ = wait_for_file(&output_path);
@@ -1330,6 +1603,11 @@ mod tests {
         assert!(!app.state.workspaces[0].tabs[0].zoomed);
         assert_eq!(app.state.mode, Mode::Terminal);
         let _ = std::fs::remove_file(output_path);
+
+        let runtimes: Vec<_> = app.terminal_runtimes.drain().collect();
+        for (_terminal_id, runtime) in runtimes {
+            runtime.shutdown();
+        }
     }
 
     #[tokio::test]
@@ -1346,7 +1624,12 @@ mod tests {
         let root_pane = workspace.tabs[0].root_pane;
         workspace.tabs[0].runtimes.insert(
             root_pane,
-            crate::pane::PaneRuntime::test_with_scrollback_bytes(20, 5, 4096, b"alpha\nbeta\n"),
+            crate::terminal::TerminalRuntime::test_with_scrollback_bytes(
+                20,
+                5,
+                4096,
+                b"alpha\nbeta\n",
+            ),
         );
         app.state.workspaces = vec![workspace];
         app.state.active = Some(0);

@@ -3,9 +3,24 @@
 //! Background tasks (PTY child watchers, future hook listeners, etc.) send
 //! events to the main loop through this channel. No polling needed.
 
+use std::time::Instant;
+
 use crate::detect::{Agent, AgentState};
 use crate::layout::PaneId;
 use crate::workspace::WorkspaceGitStatus;
+
+#[derive(Debug)]
+pub struct WorktreeAddResult {
+    pub path: std::path::PathBuf,
+    pub result: Result<(), String>,
+}
+
+#[derive(Debug)]
+pub struct WorktreeRemoveResult {
+    pub workspace_id: String,
+    pub path: std::path::PathBuf,
+    pub result: Result<(), String>,
+}
 
 /// An event from a background task to the main loop.
 #[derive(Debug)]
@@ -17,6 +32,11 @@ pub enum AppEvent {
         pane_id: PaneId,
         agent: Option<Agent>,
         state: AgentState,
+        visible_blocker: bool,
+        visible_idle: bool,
+        visible_working: bool,
+        process_exited: bool,
+        observed_at: Instant,
     },
     /// Hook-authoritative agent state was reported for a pane.
     HookStateReported {
@@ -52,4 +72,8 @@ pub enum AppEvent {
     ClipboardWrite { content: Vec<u8> },
     /// Background git status refresh completed for workspaces.
     GitStatusRefreshed { results: Vec<WorkspaceGitStatus> },
+    /// Background `git worktree add` completed.
+    WorktreeAddFinished(WorktreeAddResult),
+    /// Background `git worktree remove` completed.
+    WorktreeRemoveFinished(WorktreeRemoveResult),
 }

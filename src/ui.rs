@@ -20,7 +20,10 @@ pub(crate) mod status;
 mod tabs;
 mod widgets;
 
-use self::dialogs::{render_confirm_close_overlay, render_rename_overlay};
+use self::dialogs::{
+    render_confirm_close_overlay, render_new_linked_worktree_overlay,
+    render_open_existing_worktree_overlay, render_remove_worktree_overlay, render_rename_overlay,
+};
 use self::goto::render_goto_overlay;
 use self::keybind_help::render_keybind_help_overlay;
 use self::menus::{
@@ -50,14 +53,20 @@ use self::sidebar::{render_sidebar, render_sidebar_collapsed};
 use self::status::{render_config_diagnostic, render_toast_notification, toast_notification_rect};
 use self::tabs::render_tab_bar;
 pub(crate) use self::{
-    dialogs::{confirm_close_button_rects, confirm_close_popup_rect, rename_button_rects},
+    dialogs::{
+        confirm_close_button_rects, confirm_close_popup_rect, new_linked_worktree_button_rects,
+        new_linked_worktree_inner_rect, open_existing_worktree_button_rects,
+        open_existing_worktree_inner_rect, open_existing_worktree_visible_start,
+        remove_worktree_button_rects, remove_worktree_popup_rect, rename_button_rects,
+    },
     settings::{settings_button_rects, settings_show_primary_action},
     sidebar::{
         agent_panel_body_rect, agent_panel_entries, agent_panel_scroll_metrics,
         agent_panel_scrollbar_rect, agent_panel_toggle_rect, collapsed_sidebar_sections,
         collapsed_sidebar_toggle_rect, compute_workspace_card_areas, expanded_sidebar_sections,
-        sidebar_section_divider_rect, workspace_drop_indicator_row, workspace_list_rect,
-        workspace_list_scroll_metrics, workspace_list_scrollbar_rect,
+        normalized_workspace_scroll, sidebar_section_divider_rect, workspace_drop_indicator_row,
+        workspace_list_entries, workspace_list_rect, workspace_list_scroll_metrics,
+        workspace_list_scrollbar_rect, workspace_parent_group_state, WorkspaceListEntry,
     },
 };
 pub(crate) use self::{
@@ -72,6 +81,7 @@ pub(crate) use self::{
 };
 use crate::app::state::ViewLayout;
 use crate::app::{AppState, Mode};
+use crate::terminal::TerminalRuntimeRegistry;
 
 const COLLAPSED_WIDTH: u16 = 4; // num + space + dot + separator
 
@@ -88,8 +98,18 @@ pub(super) fn spinner_frame(tick: u32) -> &'static str {
 /// Called before render to separate mutation from drawing.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn compute_view(app: &mut AppState, area: Rect) {
+    let terminal_runtimes = TerminalRuntimeRegistry::new();
+    compute_view_with_runtime_registry(app, &terminal_runtimes, area);
+}
+
+pub fn compute_view_with_runtime_registry(
+    app: &mut AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    area: Rect,
+) {
     compute_view_internal(
         app,
+        terminal_runtimes,
         area,
         true,
         crate::kitty_graphics::HostCellSize::default(),
@@ -98,10 +118,11 @@ pub fn compute_view(app: &mut AppState, area: Rect) {
 
 pub fn compute_view_with_cell_size(
     app: &mut AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
     area: Rect,
     cell_size: crate::kitty_graphics::HostCellSize,
 ) {
-    compute_view_internal(app, area, true, cell_size);
+    compute_view_internal(app, terminal_runtimes, area, true, cell_size);
 }
 
 /// Compute view geometry for a client-sized render without resizing pane runtimes.
@@ -109,9 +130,14 @@ pub fn compute_view_with_cell_size(
 /// This is used by the headless server when a non-foreground client needs its
 /// own frame size while the shared pane runtimes stay pinned to the foreground
 /// client.
-pub(crate) fn compute_view_without_resizing_panes(app: &mut AppState, area: Rect) {
+pub(crate) fn compute_view_without_resizing_panes(
+    app: &mut AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    area: Rect,
+) {
     compute_view_internal(
         app,
+        terminal_runtimes,
         area,
         false,
         crate::kitty_graphics::HostCellSize::default(),
@@ -120,6 +146,7 @@ pub(crate) fn compute_view_without_resizing_panes(app: &mut AppState, area: Rect
 
 fn resize_background_tab_panes_to_terminal_area(
     app: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
     terminal_area: Rect,
     cell_size: crate::kitty_graphics::HostCellSize,
 ) {
@@ -128,19 +155,20 @@ fn resize_background_tab_panes_to_terminal_area(
             if app.active == Some(ws_idx) && tab_idx == ws.active_tab_index() {
                 continue;
             }
-            resize_tab_panes(app, tab, terminal_area, cell_size);
+            resize_tab_panes(app, terminal_runtimes, tab, terminal_area, cell_size);
         }
     }
 }
 
 fn compute_view_internal(
     app: &mut AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
     area: Rect,
     resize_panes: bool,
     cell_size: crate::kitty_graphics::HostCellSize,
 ) {
     if is_mobile_width(area) {
-        compute_mobile_view(app, area, resize_panes, cell_size);
+        compute_mobile_view(app, terminal_runtimes, area, resize_panes, cell_size);
         return;
     }
 
@@ -163,14 +191,15 @@ fn compute_view_internal(
         (Rect::default(), main_area)
     };
 
-    app.workspace_scroll = app
-        .workspace_scroll
-        .min(app.workspaces.len().saturating_sub(1));
     if !app.sidebar_collapsed {
+        app.workspace_scroll = normalized_workspace_scroll(app, sidebar_area, app.workspace_scroll);
         let (_, detail_area) = expanded_sidebar_sections(sidebar_area, app.sidebar_section_split);
         let max_agent_scroll = agent_panel_scroll_metrics(app, detail_area).max_offset_from_bottom;
         app.agent_panel_scroll = app.agent_panel_scroll.min(max_agent_scroll);
     } else {
+        app.workspace_scroll = app
+            .workspace_scroll
+            .min(app.workspaces.len().saturating_sub(1));
         app.agent_panel_scroll = 0;
     }
 
@@ -201,9 +230,20 @@ fn compute_view_internal(
         .map(|ws| ws.layout.splits(terminal_area))
         .unwrap_or_default();
 
-    let pane_infos = compute_pane_infos(app, terminal_area, resize_panes, cell_size);
+    let pane_infos = compute_pane_infos(
+        app,
+        terminal_runtimes,
+        terminal_area,
+        resize_panes,
+        cell_size,
+    );
     if resize_panes {
-        resize_background_tab_panes_to_terminal_area(app, terminal_area, cell_size);
+        resize_background_tab_panes_to_terminal_area(
+            app,
+            terminal_runtimes,
+            terminal_area,
+            cell_size,
+        );
     }
 
     let toast_hit_area = app
@@ -232,6 +272,7 @@ fn compute_view_internal(
 
 fn compute_mobile_view(
     app: &mut AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
     area: Rect,
     resize_panes: bool,
     cell_size: crate::kitty_graphics::HostCellSize,
@@ -257,9 +298,20 @@ fn compute_mobile_view(
         .map(|ws| ws.layout.splits(terminal_area))
         .unwrap_or_default();
 
-    let pane_infos = compute_pane_infos(app, terminal_area, resize_panes, cell_size);
+    let pane_infos = compute_pane_infos(
+        app,
+        terminal_runtimes,
+        terminal_area,
+        resize_panes,
+        cell_size,
+    );
     if resize_panes {
-        resize_background_tab_panes_to_terminal_area(app, terminal_area, cell_size);
+        resize_background_tab_panes_to_terminal_area(
+            app,
+            terminal_runtimes,
+            terminal_area,
+            cell_size,
+        );
     }
     let header_hits = compute_mobile_header_hit_areas(app, header_rect);
 
@@ -288,7 +340,17 @@ fn compute_mobile_view(
 }
 
 /// Render the UI — reads AppState but does not mutate it.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn render(app: &AppState, frame: &mut Frame) {
+    let terminal_runtimes = TerminalRuntimeRegistry::new();
+    render_with_runtime_registry(app, &terminal_runtimes, frame);
+}
+
+pub fn render_with_runtime_registry(
+    app: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    frame: &mut Frame,
+) {
     let sidebar_area = app.view.sidebar_rect;
     let tab_bar_area = app.view.tab_bar_rect;
     let terminal_area = app.view.terminal_area;
@@ -298,12 +360,15 @@ pub fn render(app: &AppState, frame: &mut Frame) {
     } else if app.sidebar_collapsed {
         render_sidebar_collapsed(app, frame, sidebar_area);
     } else {
-        render_sidebar(app, frame, sidebar_area);
+        render_sidebar(app, terminal_runtimes, frame, sidebar_area);
     }
     if app.view.layout != ViewLayout::Mobile {
         render_tab_bar(app, frame, tab_bar_area);
     }
-    render_panes(app, frame, terminal_area);
+    render_panes(app, terminal_runtimes, frame, terminal_area);
+
+    // Ambient notifications sit above panes, but below interactive overlays.
+    render_notifications(app, frame, terminal_area);
 
     match app.mode {
         Mode::Onboarding => render_onboarding_overlay(app, frame, frame.area()),
@@ -323,13 +388,19 @@ pub fn render(app: &AppState, frame: &mut Frame) {
         Mode::RenameWorkspace | Mode::RenameTab | Mode::RenamePane => {
             render_rename_overlay(app, frame, frame.area())
         }
+        Mode::NewLinkedWorktree => render_new_linked_worktree_overlay(app, frame, frame.area()),
+        Mode::OpenExistingWorktree => {
+            render_open_existing_worktree_overlay(app, frame, frame.area())
+        }
+        Mode::ConfirmRemoveWorktree => render_remove_worktree_overlay(app, frame, frame.area()),
         Mode::GlobalMenu => render_global_launcher_menu(app, frame),
         Mode::KeybindHelp => render_keybind_help_overlay(app, frame),
         Mode::Goto => render_goto_overlay(app, frame),
         Mode::Terminal => {}
     }
+}
 
-    // Notifications (rendered on top of everything)
+fn render_notifications(app: &AppState, frame: &mut Frame, terminal_area: Rect) {
     let has_config_diagnostic = app.config_diagnostic.is_some();
     if let Some(message) = &app.config_diagnostic {
         render_config_diagnostic(frame, terminal_area, message, &app.palette);
@@ -452,6 +523,47 @@ mod tests {
             app.view.mobile_menu_hit_area.x + app.view.mobile_menu_hit_area.width,
             44
         );
+    }
+
+    #[test]
+    fn product_announcement_renders_above_config_diagnostic() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::ProductAnnouncement;
+        app.product_announcement = Some(crate::app::state::ProductAnnouncementState {
+            version: "0.6.0".into(),
+            id: "keybinding-v2".into(),
+            title: "Keybinding syntax changed".into(),
+            body: "### Update\n- Body".into(),
+            scroll: 0,
+            preview: false,
+        });
+        app.config_diagnostic = Some(
+            "unsafe direct keybinding: keys.new_workspace = \"n\"\nunsafe direct keybinding: keys.new_tab = \"c\""
+                .into(),
+        );
+
+        let area = Rect::new(0, 0, 44, 20);
+        compute_view(&mut app, area);
+
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let popup = centered_popup_rect(
+            area,
+            PRODUCT_ANNOUNCEMENT_MODAL_SIZE.0,
+            PRODUCT_ANNOUNCEMENT_MODAL_SIZE.1,
+        )
+        .expect("announcement popup");
+        let title_row = popup.y + 1;
+        let row = buffer_row_text(buffer, Rect::new(0, title_row, area.width, 1), title_row);
+
+        assert!(row.contains("Keybinding syntax changed"));
+        assert!(!row.contains("config warning"));
     }
 
     #[test]
