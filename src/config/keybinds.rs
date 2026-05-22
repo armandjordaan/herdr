@@ -279,6 +279,7 @@ pub struct Keybinds {
     pub resize_mode: ActionKeybinds,
     pub toggle_sidebar: ActionKeybinds,
     pub goto: ActionKeybinds,
+    pub goto_blocked: ActionKeybinds,
     pub custom_commands: Vec<CustomCommandKeybind>,
 }
 
@@ -415,6 +416,7 @@ impl Config {
             resize_mode: action!("keys.resize_mode", &self.keys.resize_mode),
             toggle_sidebar: action!("keys.toggle_sidebar", &self.keys.toggle_sidebar),
             goto: action!("keys.goto", &self.keys.goto),
+            goto_blocked: action!("keys.goto_blocked", &self.keys.goto_blocked),
             custom_commands: Vec::new(),
         };
 

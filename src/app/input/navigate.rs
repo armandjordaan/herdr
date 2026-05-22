@@ -483,6 +483,7 @@ pub(crate) enum NavigateAction {
     OpenNotificationTarget,
     Detach,
     Goto,
+    GotoBlocked,
 }
 
 fn indexed_navigation_action(
@@ -579,6 +580,7 @@ fn action_for_key(
         ),
         (&kb.detach, NavigateAction::Detach),
         (&kb.goto, NavigateAction::Goto),
+        (&kb.goto_blocked, NavigateAction::GotoBlocked),
     ] {
         if action_matches(bindings, key, dispatch) {
             return Some(action);
@@ -742,6 +744,10 @@ pub(super) fn execute_navigate_action_in_context(
             leave_navigate_mode(state);
         }
         NavigateAction::Goto => super::goto::open_goto(state),
+        NavigateAction::GotoBlocked => super::goto::open_goto_with_category(
+            state,
+            crate::app::state::GotoCategory::BlockedAgents,
+        ),
     }
 
     finish_action_context(state, context, previous_mode);
@@ -1230,8 +1236,8 @@ mod tests {
             output_path.display()
         );
         app.state.keybinds.custom_commands = vec![crate::config::CustomCommandKeybind {
-            bindings: crate::config::ActionKeybinds::prefix("g"),
-            label: "prefix+g".into(),
+            bindings: crate::config::ActionKeybinds::prefix("y"),
+            label: "prefix+y".into(),
             command,
             action: crate::config::CustomCommandAction::Shell,
         }];
@@ -1243,7 +1249,7 @@ mod tests {
         .await;
         assert_eq!(app.state.mode, Mode::Prefix);
 
-        app.handle_key(TerminalKey::new(KeyCode::Char('g'), KeyModifiers::empty()))
+        app.handle_key(TerminalKey::new(KeyCode::Char('y'), KeyModifiers::empty()))
             .await;
 
         let content = wait_for_file(&output_path);
@@ -1291,8 +1297,8 @@ mod tests {
         let output_path = unique_temp_path("custom-pane-command");
         let command = format!("printf done > '{}'", output_path.display());
         app.state.keybinds.custom_commands = vec![crate::config::CustomCommandKeybind {
-            bindings: crate::config::ActionKeybinds::prefix("g"),
-            label: "prefix+g".into(),
+            bindings: crate::config::ActionKeybinds::prefix("y"),
+            label: "prefix+y".into(),
             command,
             action: crate::config::CustomCommandAction::Pane,
         }];
@@ -1302,7 +1308,7 @@ mod tests {
             app.state.prefix_mods,
         ))
         .await;
-        app.handle_key(TerminalKey::new(KeyCode::Char('g'), KeyModifiers::empty()))
+        app.handle_key(TerminalKey::new(KeyCode::Char('y'), KeyModifiers::empty()))
             .await;
 
         assert_eq!(app.state.workspaces[0].tabs[0].layout.pane_count(), 2);

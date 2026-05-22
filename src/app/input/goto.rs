@@ -22,6 +22,12 @@ pub(crate) fn open_goto(state: &mut AppState) {
     state.mode = Mode::Goto;
 }
 
+pub(crate) fn open_goto_with_category(state: &mut AppState, category: GotoCategory) {
+    open_goto(state);
+    state.goto.category = Some(category);
+    rerank(state);
+}
+
 pub(crate) fn handle_goto_key(state: &mut AppState, key: KeyEvent) {
     match (key.code, key.modifiers) {
         (KeyCode::Esc, _) => leave_goto(state),
@@ -523,6 +529,37 @@ mod tests {
             &mut state,
             KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT),
         );
+        assert_eq!(state.goto.category, Some(GotoCategory::BlockedAgents));
+        assert_eq!(state.goto.items.len(), 1);
+        assert!(matches!(
+            state.goto.items[0].agent_status,
+            Some((AgentState::Blocked, _))
+        ));
+    }
+
+    #[test]
+    fn open_goto_with_category_applies_blocked_filter() {
+        use crate::detect::{Agent, AgentState};
+        let mut state = state_with_two_workspaces();
+        for ws_idx in 0..2 {
+            let ws = &state.workspaces[ws_idx];
+            let pane_id = ws.tabs[0].root_pane;
+            let terminal_id = ws.tabs[0]
+                .panes
+                .get(&pane_id)
+                .unwrap()
+                .attached_terminal_id
+                .clone();
+            let terminal = state.terminals.get_mut(&terminal_id).unwrap();
+            let agent_state = if ws_idx == 0 {
+                AgentState::Idle
+            } else {
+                AgentState::Blocked
+            };
+            terminal.set_detected_state(Some(Agent::Claude), agent_state);
+        }
+        open_goto_with_category(&mut state, GotoCategory::BlockedAgents);
+        assert_eq!(state.mode, Mode::Goto);
         assert_eq!(state.goto.category, Some(GotoCategory::BlockedAgents));
         assert_eq!(state.goto.items.len(), 1);
         assert!(matches!(

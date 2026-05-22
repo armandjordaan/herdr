@@ -59,6 +59,7 @@ pub(super) fn keybind_help_groups(
             (keybind_label(&kb.detach), "detach"),
             (keybind_label(&kb.reload_config), "reload config"),
             (keybind_label(&kb.goto), "goto (space / tab / agent)"),
+            (keybind_label(&kb.goto_blocked), "goto blocked agents"),
             (
                 keybind_label(&kb.open_notification_target),
                 "open notification target",
