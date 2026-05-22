@@ -784,9 +784,10 @@ pub(super) fn execute_navigate_action_in_context(
             super::modal::request_detach(state);
             leave_navigate_mode(state);
         }
-        NavigateAction::Goto => super::goto::open_goto(state),
+        NavigateAction::Goto => super::goto::open_goto(state, terminal_runtimes),
         NavigateAction::GotoBlocked => super::goto::open_goto_with_category(
             state,
+            terminal_runtimes,
             crate::app::state::GotoCategory::BlockedAgents,
         ),
     }

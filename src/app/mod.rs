@@ -1201,7 +1201,7 @@ impl App {
                 input::handle_global_menu_key(&mut self.state, key_event);
             }
             Mode::Goto => {
-                input::handle_goto_key(&mut self.state, key_event);
+                input::handle_goto_key(&mut self.state, &self.terminal_runtimes, key_event);
             }
             Mode::Onboarding => {
                 self.handle_onboarding_key(key_event);

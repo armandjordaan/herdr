@@ -85,7 +85,9 @@ impl App {
                     Mode::Settings => self.handle_settings_key(key_event),
                     Mode::GlobalMenu => handle_global_menu_key(&mut self.state, key_event),
                     Mode::KeybindHelp => handle_keybind_help_key(&mut self.state, key_event),
-                    Mode::Goto => handle_goto_key(&mut self.state, key_event),
+                    Mode::Goto => {
+                        handle_goto_key(&mut self.state, &self.terminal_runtimes, key_event)
+                    }
                     Mode::Terminal => unreachable!(),
                 }
             }

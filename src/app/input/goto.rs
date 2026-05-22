@@ -6,13 +6,14 @@ use nucleo_matcher::{
 
 use crate::app::state::{AppState, GotoCategory, GotoItem, GotoTarget, Mode};
 use crate::detect::AgentState;
+use crate::terminal::TerminalRuntimeRegistry;
 
 const GOTO_PAGE_STEP: usize = 8;
 
-pub(crate) fn open_goto(state: &mut AppState) {
+pub(crate) fn open_goto(state: &mut AppState, terminal_runtimes: &TerminalRuntimeRegistry) {
     state.goto.filter.clear();
     state.goto.category = None;
-    state.goto.items = rebuild_items(state);
+    state.goto.items = rebuild_items(state, terminal_runtimes);
     state.goto.list = state
         .goto
         .items
@@ -22,13 +23,21 @@ pub(crate) fn open_goto(state: &mut AppState) {
     state.mode = Mode::Goto;
 }
 
-pub(crate) fn open_goto_with_category(state: &mut AppState, category: GotoCategory) {
-    open_goto(state);
+pub(crate) fn open_goto_with_category(
+    state: &mut AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    category: GotoCategory,
+) {
+    open_goto(state, terminal_runtimes);
     state.goto.category = Some(category);
-    rerank(state);
+    rerank(state, terminal_runtimes);
 }
 
-pub(crate) fn handle_goto_key(state: &mut AppState, key: KeyEvent) {
+pub(crate) fn handle_goto_key(
+    state: &mut AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    key: KeyEvent,
+) {
     match (key.code, key.modifiers) {
         (KeyCode::Esc, _) => leave_goto(state),
         (KeyCode::Enter, _) => apply_goto(state),
@@ -62,31 +71,41 @@ pub(crate) fn handle_goto_key(state: &mut AppState, key: KeyEvent) {
         }
         (KeyCode::Backspace, _) => {
             state.goto.filter.pop();
-            rerank(state);
+            rerank(state, terminal_runtimes);
         }
-        (KeyCode::Char('t'), KeyModifiers::ALT) => toggle_category(state, GotoCategory::Tabs),
-        (KeyCode::Char('w'), KeyModifiers::ALT) => toggle_category(state, GotoCategory::Workspaces),
-        (KeyCode::Char('a'), KeyModifiers::ALT) => toggle_category(state, GotoCategory::Agents),
+        (KeyCode::Char('t'), KeyModifiers::ALT) => {
+            toggle_category(state, terminal_runtimes, GotoCategory::Tabs)
+        }
+        (KeyCode::Char('w'), KeyModifiers::ALT) => {
+            toggle_category(state, terminal_runtimes, GotoCategory::Workspaces)
+        }
+        (KeyCode::Char('a'), KeyModifiers::ALT) => {
+            toggle_category(state, terminal_runtimes, GotoCategory::Agents)
+        }
         (KeyCode::Char('b'), KeyModifiers::ALT) => {
-            toggle_category(state, GotoCategory::BlockedAgents)
+            toggle_category(state, terminal_runtimes, GotoCategory::BlockedAgents)
         }
         (KeyCode::Char(c), mods)
             if mods == KeyModifiers::empty() || mods == KeyModifiers::SHIFT =>
         {
             state.goto.filter.push(c);
-            rerank(state);
+            rerank(state, terminal_runtimes);
         }
         _ => {}
     }
 }
 
-fn toggle_category(state: &mut AppState, category: GotoCategory) {
+fn toggle_category(
+    state: &mut AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+    category: GotoCategory,
+) {
     state.goto.category = if state.goto.category == Some(category) {
         None
     } else {
         Some(category)
     };
-    rerank(state);
+    rerank(state, terminal_runtimes);
 }
 
 fn leave_goto(state: &mut AppState) {
@@ -133,7 +152,10 @@ fn apply_goto(state: &mut AppState) {
     leave_goto(state);
 }
 
-pub(crate) fn rebuild_items(state: &AppState) -> Vec<GotoItem> {
+pub(crate) fn rebuild_items(
+    state: &AppState,
+    terminal_runtimes: &TerminalRuntimeRegistry,
+) -> Vec<GotoItem> {
     let mut items = Vec::new();
     let active_ws = state.active;
     let focused_pane = active_ws
@@ -141,7 +163,7 @@ pub(crate) fn rebuild_items(state: &AppState) -> Vec<GotoItem> {
         .and_then(|ws| ws.focused_pane_id());
 
     for (ws_idx, ws) in state.workspaces.iter().enumerate() {
-        let ws_name = ws.display_name_from(&state.terminals, &state.terminal_runtimes);
+        let ws_name = ws.display_name_from(&state.terminals, terminal_runtimes);
         items.push(GotoItem {
             target: GotoTarget::Space { ws_idx },
             label: format!("[space] {ws_name}"),
@@ -208,8 +230,8 @@ pub(crate) fn rebuild_items(state: &AppState) -> Vec<GotoItem> {
     items
 }
 
-fn rerank(state: &mut AppState) {
-    let all: Vec<GotoItem> = rebuild_items(state)
+fn rerank(state: &mut AppState, terminal_runtimes: &TerminalRuntimeRegistry) {
+    let all: Vec<GotoItem> = rebuild_items(state, terminal_runtimes)
         .into_iter()
         .filter(|item| matches_category(item, state.goto.category))
         .collect();
@@ -280,7 +302,7 @@ mod tests {
     #[test]
     fn open_goto_populates_items_and_preselects_current() {
         let mut state = state_with_two_workspaces();
-        open_goto(&mut state);
+        open_goto(&mut state, &TerminalRuntimeRegistry::new());
         assert_eq!(state.mode, Mode::Goto);
         assert!(!state.goto.items.is_empty());
         let selected = &state.goto.items[state.goto.list];
@@ -290,7 +312,7 @@ mod tests {
     #[test]
     fn rebuild_skips_non_agent_panes() {
         let state = state_with_two_workspaces();
-        let items = rebuild_items(&state);
+        let items = rebuild_items(&state, &TerminalRuntimeRegistry::new());
         let spaces = items
             .iter()
             .filter(|i| matches!(i.target, GotoTarget::Space { .. }))
@@ -326,7 +348,7 @@ mod tests {
         terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
         terminal.set_agent_name("my-claude".into());
 
-        let items = rebuild_items(&state);
+        let items = rebuild_items(&state, &TerminalRuntimeRegistry::new());
         let agent_rows: Vec<_> = items
             .iter()
             .filter(|i| matches!(i.target, GotoTarget::Agent { .. }))
@@ -368,7 +390,7 @@ mod tests {
             .unwrap()
             .set_agent_name("orphan".into());
 
-        let items = rebuild_items(&state);
+        let items = rebuild_items(&state, &TerminalRuntimeRegistry::new());
         let agents = items
             .iter()
             .filter(|i| matches!(i.target, GotoTarget::Agent { .. }))
@@ -379,7 +401,7 @@ mod tests {
     #[test]
     fn enter_jumps_to_selected_space() {
         let mut state = state_with_two_workspaces();
-        open_goto(&mut state);
+        open_goto(&mut state, &TerminalRuntimeRegistry::new());
         let beta_idx = state
             .goto
             .items
@@ -391,6 +413,7 @@ mod tests {
         state.goto.list = beta_idx;
         handle_goto_key(
             &mut state,
+            &TerminalRuntimeRegistry::new(),
             KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
         );
         assert_eq!(state.active, Some(1));
@@ -400,9 +423,10 @@ mod tests {
     #[test]
     fn esc_closes_without_navigating() {
         let mut state = state_with_two_workspaces();
-        open_goto(&mut state);
+        open_goto(&mut state, &TerminalRuntimeRegistry::new());
         handle_goto_key(
             &mut state,
+            &TerminalRuntimeRegistry::new(),
             KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
         );
         assert_eq!(state.mode, Mode::Terminal);
@@ -413,13 +437,14 @@ mod tests {
     #[test]
     fn page_up_down_jumps_by_step_and_clamps() {
         let mut state = state_with_two_workspaces();
-        open_goto(&mut state);
+        open_goto(&mut state, &TerminalRuntimeRegistry::new());
         let total = state.goto.items.len();
         assert!(total > 0);
 
         state.goto.list = 0;
         handle_goto_key(
             &mut state,
+            &TerminalRuntimeRegistry::new(),
             KeyEvent::new(KeyCode::PageDown, KeyModifiers::empty()),
         );
         let expected_down = GOTO_PAGE_STEP.min(total - 1);
@@ -427,6 +452,7 @@ mod tests {
 
         handle_goto_key(
             &mut state,
+            &TerminalRuntimeRegistry::new(),
             KeyEvent::new(KeyCode::PageUp, KeyModifiers::empty()),
         );
         assert_eq!(state.goto.list, expected_down.saturating_sub(GOTO_PAGE_STEP));
@@ -435,6 +461,7 @@ mod tests {
         state.goto.list = total - 1;
         handle_goto_key(
             &mut state,
+            &TerminalRuntimeRegistry::new(),
             KeyEvent::new(KeyCode::PageDown, KeyModifiers::empty()),
         );
         assert_eq!(state.goto.list, total - 1);
@@ -443,6 +470,7 @@ mod tests {
         state.goto.list = 0;
         handle_goto_key(
             &mut state,
+            &TerminalRuntimeRegistry::new(),
             KeyEvent::new(KeyCode::PageUp, KeyModifiers::empty()),
         );
         assert_eq!(state.goto.list, 0);
@@ -451,18 +479,20 @@ mod tests {
     #[test]
     fn home_and_end_jump_to_edges() {
         let mut state = state_with_two_workspaces();
-        open_goto(&mut state);
+        open_goto(&mut state, &TerminalRuntimeRegistry::new());
         let total = state.goto.items.len();
         assert!(total > 0);
 
         handle_goto_key(
             &mut state,
+            &TerminalRuntimeRegistry::new(),
             KeyEvent::new(KeyCode::End, KeyModifiers::empty()),
         );
         assert_eq!(state.goto.list, total - 1);
 
         handle_goto_key(
             &mut state,
+            &TerminalRuntimeRegistry::new(),
             KeyEvent::new(KeyCode::Home, KeyModifiers::empty()),
         );
         assert_eq!(state.goto.list, 0);
@@ -471,9 +501,10 @@ mod tests {
     #[test]
     fn alt_w_filters_to_workspaces_only() {
         let mut state = state_with_two_workspaces();
-        open_goto(&mut state);
+        open_goto(&mut state, &TerminalRuntimeRegistry::new());
         handle_goto_key(
             &mut state,
+            &TerminalRuntimeRegistry::new(),
             KeyEvent::new(KeyCode::Char('w'), KeyModifiers::ALT),
         );
         assert_eq!(state.goto.category, Some(GotoCategory::Workspaces));
@@ -488,9 +519,10 @@ mod tests {
     #[test]
     fn alt_t_filters_to_tabs_only() {
         let mut state = state_with_two_workspaces();
-        open_goto(&mut state);
+        open_goto(&mut state, &TerminalRuntimeRegistry::new());
         handle_goto_key(
             &mut state,
+            &TerminalRuntimeRegistry::new(),
             KeyEvent::new(KeyCode::Char('t'), KeyModifiers::ALT),
         );
         assert_eq!(state.goto.category, Some(GotoCategory::Tabs));
@@ -524,9 +556,10 @@ mod tests {
             };
             terminal.set_detected_state(Some(Agent::Claude), agent_state);
         }
-        open_goto(&mut state);
+        open_goto(&mut state, &TerminalRuntimeRegistry::new());
         handle_goto_key(
             &mut state,
+            &TerminalRuntimeRegistry::new(),
             KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT),
         );
         assert_eq!(state.goto.category, Some(GotoCategory::BlockedAgents));
@@ -558,7 +591,11 @@ mod tests {
             };
             terminal.set_detected_state(Some(Agent::Claude), agent_state);
         }
-        open_goto_with_category(&mut state, GotoCategory::BlockedAgents);
+        open_goto_with_category(
+            &mut state,
+            &TerminalRuntimeRegistry::new(),
+            GotoCategory::BlockedAgents,
+        );
         assert_eq!(state.mode, Mode::Goto);
         assert_eq!(state.goto.category, Some(GotoCategory::BlockedAgents));
         assert_eq!(state.goto.items.len(), 1);
@@ -571,15 +608,17 @@ mod tests {
     #[test]
     fn alt_key_toggles_category_off() {
         let mut state = state_with_two_workspaces();
-        open_goto(&mut state);
+        open_goto(&mut state, &TerminalRuntimeRegistry::new());
         let total = state.goto.items.len();
         handle_goto_key(
             &mut state,
+            &TerminalRuntimeRegistry::new(),
             KeyEvent::new(KeyCode::Char('w'), KeyModifiers::ALT),
         );
         assert_eq!(state.goto.category, Some(GotoCategory::Workspaces));
         handle_goto_key(
             &mut state,
+            &TerminalRuntimeRegistry::new(),
             KeyEvent::new(KeyCode::Char('w'), KeyModifiers::ALT),
         );
         assert_eq!(state.goto.category, None);
@@ -589,13 +628,15 @@ mod tests {
     #[test]
     fn alt_key_replaces_prior_category() {
         let mut state = state_with_two_workspaces();
-        open_goto(&mut state);
+        open_goto(&mut state, &TerminalRuntimeRegistry::new());
         handle_goto_key(
             &mut state,
+            &TerminalRuntimeRegistry::new(),
             KeyEvent::new(KeyCode::Char('w'), KeyModifiers::ALT),
         );
         handle_goto_key(
             &mut state,
+            &TerminalRuntimeRegistry::new(),
             KeyEvent::new(KeyCode::Char('t'), KeyModifiers::ALT),
         );
         assert_eq!(state.goto.category, Some(GotoCategory::Tabs));
@@ -604,10 +645,11 @@ mod tests {
     #[test]
     fn plain_letter_keys_still_type_into_filter() {
         let mut state = state_with_two_workspaces();
-        open_goto(&mut state);
+        open_goto(&mut state, &TerminalRuntimeRegistry::new());
         for ch in ['t', 'w', 'a', 'b'] {
             handle_goto_key(
                 &mut state,
+                &TerminalRuntimeRegistry::new(),
                 KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty()),
             );
         }
@@ -618,22 +660,26 @@ mod tests {
     #[test]
     fn typing_filters_items() {
         let mut state = state_with_two_workspaces();
-        open_goto(&mut state);
+        open_goto(&mut state, &TerminalRuntimeRegistry::new());
         let before = state.goto.items.len();
         handle_goto_key(
             &mut state,
+            &TerminalRuntimeRegistry::new(),
             KeyEvent::new(KeyCode::Char('b'), KeyModifiers::empty()),
         );
         handle_goto_key(
             &mut state,
+            &TerminalRuntimeRegistry::new(),
             KeyEvent::new(KeyCode::Char('e'), KeyModifiers::empty()),
         );
         handle_goto_key(
             &mut state,
+            &TerminalRuntimeRegistry::new(),
             KeyEvent::new(KeyCode::Char('t'), KeyModifiers::empty()),
         );
         handle_goto_key(
             &mut state,
+            &TerminalRuntimeRegistry::new(),
             KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty()),
         );
         assert!(state.goto.items.len() < before);
