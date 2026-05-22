@@ -4,12 +4,14 @@ use nucleo_matcher::{
     Config, Matcher,
 };
 
-use crate::app::state::{AppState, GotoItem, GotoTarget, Mode};
+use crate::app::state::{AppState, GotoCategory, GotoItem, GotoTarget, Mode};
+use crate::detect::AgentState;
 
 const GOTO_PAGE_STEP: usize = 8;
 
 pub(crate) fn open_goto(state: &mut AppState) {
     state.goto.filter.clear();
+    state.goto.category = None;
     state.goto.items = rebuild_items(state);
     state.goto.list = state
         .goto
@@ -56,6 +58,12 @@ pub(crate) fn handle_goto_key(state: &mut AppState, key: KeyEvent) {
             state.goto.filter.pop();
             rerank(state);
         }
+        (KeyCode::Char('t'), KeyModifiers::ALT) => toggle_category(state, GotoCategory::Tabs),
+        (KeyCode::Char('w'), KeyModifiers::ALT) => toggle_category(state, GotoCategory::Workspaces),
+        (KeyCode::Char('a'), KeyModifiers::ALT) => toggle_category(state, GotoCategory::Agents),
+        (KeyCode::Char('b'), KeyModifiers::ALT) => {
+            toggle_category(state, GotoCategory::BlockedAgents)
+        }
         (KeyCode::Char(c), mods)
             if mods == KeyModifiers::empty() || mods == KeyModifiers::SHIFT =>
         {
@@ -66,10 +74,20 @@ pub(crate) fn handle_goto_key(state: &mut AppState, key: KeyEvent) {
     }
 }
 
+fn toggle_category(state: &mut AppState, category: GotoCategory) {
+    state.goto.category = if state.goto.category == Some(category) {
+        None
+    } else {
+        Some(category)
+    };
+    rerank(state);
+}
+
 fn leave_goto(state: &mut AppState) {
     state.goto.filter.clear();
     state.goto.items.clear();
     state.goto.list = 0;
+    state.goto.category = None;
     state.mode = if state.active.is_some() {
         Mode::Terminal
     } else {
@@ -185,7 +203,10 @@ pub(crate) fn rebuild_items(state: &AppState) -> Vec<GotoItem> {
 }
 
 fn rerank(state: &mut AppState) {
-    let all = rebuild_items(state);
+    let all: Vec<GotoItem> = rebuild_items(state)
+        .into_iter()
+        .filter(|item| matches_category(item, state.goto.category))
+        .collect();
 
     if state.goto.filter.is_empty() {
         let selected_pos = all
@@ -217,6 +238,19 @@ fn rerank(state: &mut AppState) {
     scored.sort_by(|a, b| b.1.cmp(&a.1));
     state.goto.items = scored.into_iter().map(|(item, _)| item).collect();
     state.goto.list = 0;
+}
+
+fn matches_category(item: &GotoItem, category: Option<GotoCategory>) -> bool {
+    match category {
+        None => true,
+        Some(GotoCategory::Workspaces) => matches!(item.target, GotoTarget::Space { .. }),
+        Some(GotoCategory::Tabs) => matches!(item.target, GotoTarget::Tab { .. }),
+        Some(GotoCategory::Agents) => matches!(item.target, GotoTarget::Agent { .. }),
+        Some(GotoCategory::BlockedAgents) => {
+            matches!(item.target, GotoTarget::Agent { .. })
+                && matches!(item.agent_status, Some((AgentState::Blocked, _)))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -426,6 +460,122 @@ mod tests {
             KeyEvent::new(KeyCode::Home, KeyModifiers::empty()),
         );
         assert_eq!(state.goto.list, 0);
+    }
+
+    #[test]
+    fn alt_w_filters_to_workspaces_only() {
+        let mut state = state_with_two_workspaces();
+        open_goto(&mut state);
+        handle_goto_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::ALT),
+        );
+        assert_eq!(state.goto.category, Some(GotoCategory::Workspaces));
+        assert!(!state.goto.items.is_empty());
+        assert!(state
+            .goto
+            .items
+            .iter()
+            .all(|item| matches!(item.target, GotoTarget::Space { .. })));
+    }
+
+    #[test]
+    fn alt_t_filters_to_tabs_only() {
+        let mut state = state_with_two_workspaces();
+        open_goto(&mut state);
+        handle_goto_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::ALT),
+        );
+        assert_eq!(state.goto.category, Some(GotoCategory::Tabs));
+        assert!(!state.goto.items.is_empty());
+        assert!(state
+            .goto
+            .items
+            .iter()
+            .all(|item| matches!(item.target, GotoTarget::Tab { .. })));
+    }
+
+    #[test]
+    fn alt_b_filters_to_blocked_agents_only() {
+        use crate::detect::{Agent, AgentState};
+        let mut state = state_with_two_workspaces();
+        // Make one agent blocked and another idle so we can confirm the filter.
+        for ws_idx in 0..2 {
+            let ws = &state.workspaces[ws_idx];
+            let pane_id = ws.tabs[0].root_pane;
+            let terminal_id = ws.tabs[0]
+                .panes
+                .get(&pane_id)
+                .unwrap()
+                .attached_terminal_id
+                .clone();
+            let terminal = state.terminals.get_mut(&terminal_id).unwrap();
+            let agent_state = if ws_idx == 0 {
+                AgentState::Idle
+            } else {
+                AgentState::Blocked
+            };
+            terminal.set_detected_state(Some(Agent::Claude), agent_state);
+        }
+        open_goto(&mut state);
+        handle_goto_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT),
+        );
+        assert_eq!(state.goto.category, Some(GotoCategory::BlockedAgents));
+        assert_eq!(state.goto.items.len(), 1);
+        assert!(matches!(
+            state.goto.items[0].agent_status,
+            Some((AgentState::Blocked, _))
+        ));
+    }
+
+    #[test]
+    fn alt_key_toggles_category_off() {
+        let mut state = state_with_two_workspaces();
+        open_goto(&mut state);
+        let total = state.goto.items.len();
+        handle_goto_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::ALT),
+        );
+        assert_eq!(state.goto.category, Some(GotoCategory::Workspaces));
+        handle_goto_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::ALT),
+        );
+        assert_eq!(state.goto.category, None);
+        assert_eq!(state.goto.items.len(), total);
+    }
+
+    #[test]
+    fn alt_key_replaces_prior_category() {
+        let mut state = state_with_two_workspaces();
+        open_goto(&mut state);
+        handle_goto_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::ALT),
+        );
+        handle_goto_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::ALT),
+        );
+        assert_eq!(state.goto.category, Some(GotoCategory::Tabs));
+    }
+
+    #[test]
+    fn plain_letter_keys_still_type_into_filter() {
+        let mut state = state_with_two_workspaces();
+        open_goto(&mut state);
+        for ch in ['t', 'w', 'a', 'b'] {
+            handle_goto_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty()),
+            );
+        }
+        assert_eq!(state.goto.filter, "twab");
+        assert_eq!(state.goto.category, None);
     }
 
     #[test]

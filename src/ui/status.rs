@@ -125,7 +125,7 @@ pub(super) fn agent_icon(
     }
 }
 
-pub(super) fn state_label(state: AgentState, seen: bool) -> &'static str {
+pub(crate) fn state_label(state: AgentState, seen: bool) -> &'static str {
     match (state, seen) {
         (AgentState::Blocked, _) => "blocked",
         (AgentState::Working, _) => "working",
@@ -135,7 +135,7 @@ pub(super) fn state_label(state: AgentState, seen: bool) -> &'static str {
     }
 }
 
-pub(super) fn state_label_color(state: AgentState, seen: bool, p: &Palette) -> Color {
+pub(crate) fn state_label_color(state: AgentState, seen: bool, p: &Palette) -> Color {
     match (state, seen) {
         (AgentState::Blocked, _) => p.red,
         (AgentState::Working, _) => p.yellow,

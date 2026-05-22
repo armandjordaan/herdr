@@ -16,7 +16,7 @@ mod release_notes;
 mod scrollbar;
 mod settings;
 mod sidebar;
-mod status;
+pub(crate) mod status;
 mod tabs;
 mod widgets;
 

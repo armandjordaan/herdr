@@ -626,6 +626,18 @@ pub struct GotoItem {
     pub label: String,
     pub haystack: String,
     pub is_current: bool,
+    /// For Agent rows: the detected AgentState and whether the pane has been
+    /// seen since the last transition to Idle (the same `seen` flag used by
+    /// the sidebar to render "done" vs "idle").
+    pub agent_status: Option<(crate::detect::AgentState, bool)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GotoCategory {
+    Workspaces,
+    Tabs,
+    Agents,
+    BlockedAgents,
 }
 
 #[derive(Debug, Default)]
@@ -633,6 +645,7 @@ pub struct GotoState {
     pub filter: String,
     pub list: usize,
     pub items: Vec<GotoItem>,
+    pub category: Option<GotoCategory>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
