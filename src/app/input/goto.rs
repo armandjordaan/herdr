@@ -6,6 +6,8 @@ use nucleo_matcher::{
 
 use crate::app::state::{AppState, GotoItem, GotoTarget, Mode};
 
+const GOTO_PAGE_STEP: usize = 8;
+
 pub(crate) fn open_goto(state: &mut AppState) {
     state.goto.filter.clear();
     state.goto.items = rebuild_items(state);
@@ -28,6 +30,26 @@ pub(crate) fn handle_goto_key(state: &mut AppState, key: KeyEvent) {
         (KeyCode::Down, _) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
             if !state.goto.items.is_empty() {
                 state.goto.list = (state.goto.list + 1).min(state.goto.items.len() - 1);
+            }
+        }
+        (KeyCode::PageUp, _) => {
+            state.goto.list = state.goto.list.saturating_sub(GOTO_PAGE_STEP);
+        }
+        (KeyCode::PageDown, _) => {
+            if !state.goto.items.is_empty() {
+                state.goto.list = state
+                    .goto
+                    .list
+                    .saturating_add(GOTO_PAGE_STEP)
+                    .min(state.goto.items.len() - 1);
+            }
+        }
+        (KeyCode::Home, _) => {
+            state.goto.list = 0;
+        }
+        (KeyCode::End, _) => {
+            if !state.goto.items.is_empty() {
+                state.goto.list = state.goto.items.len() - 1;
             }
         }
         (KeyCode::Backspace, _) => {
@@ -101,6 +123,7 @@ pub(crate) fn rebuild_items(state: &AppState) -> Vec<GotoItem> {
             label: format!("[space] {ws_name}"),
             haystack: format!("space {ws_name}").to_lowercase(),
             is_current: Some(ws_idx) == active_ws,
+            agent_status: None,
         });
 
         for (tab_idx, tab) in ws.tabs.iter().enumerate() {
@@ -112,6 +135,7 @@ pub(crate) fn rebuild_items(state: &AppState) -> Vec<GotoItem> {
                 label: tab_label,
                 haystack: tab_haystack,
                 is_current: Some(ws_idx) == active_ws && ws.active_tab == tab_idx,
+                agent_status: None,
             });
 
             for pane_id in tab.layout.pane_ids() {
@@ -132,11 +156,14 @@ pub(crate) fn rebuild_items(state: &AppState) -> Vec<GotoItem> {
                     .clone()
                     .unwrap_or_else(|| effective.to_string());
 
+                let status = crate::ui::status::state_label(terminal.state, pane.seen);
                 let agent_label_view = format!(
                     "[agent] {ws_name} \u{203a} {tab_name} \u{203a} {agent_label}"
                 );
-                let agent_haystack =
-                    format!("agent {ws_name} {tab_name} {agent_label}").to_lowercase();
+                let agent_haystack = format!(
+                    "agent {ws_name} {tab_name} {agent_label} {status}"
+                )
+                .to_lowercase();
                 items.push(GotoItem {
                     target: GotoTarget::Agent {
                         ws_idx,
@@ -148,6 +175,7 @@ pub(crate) fn rebuild_items(state: &AppState) -> Vec<GotoItem> {
                     is_current: Some(ws_idx) == active_ws
                         && ws.active_tab == tab_idx
                         && focused_pane == Some(pane_id),
+                    agent_status: Some((terminal.state, pane.seen)),
                 });
             }
         }
@@ -266,6 +294,18 @@ mod tests {
         assert_eq!(agent_rows.len(), 1);
         // agent_name overrides the displayed label.
         assert!(agent_rows[0].label.contains("my-claude"));
+        // Agent rows carry a status so the picker can render idle/working/etc.
+        assert_eq!(
+            agent_rows[0].agent_status,
+            Some((AgentState::Idle, true))
+        );
+        // And the haystack lets the user filter by that status.
+        assert!(agent_rows[0].haystack.contains("idle"));
+        // Non-agent rows stay status-less.
+        assert!(items
+            .iter()
+            .filter(|i| !matches!(i.target, GotoTarget::Agent { .. }))
+            .all(|i| i.agent_status.is_none()));
     }
 
     #[test]
@@ -328,6 +368,64 @@ mod tests {
         assert_eq!(state.mode, Mode::Terminal);
         assert_eq!(state.active, Some(0));
         assert!(state.goto.items.is_empty());
+    }
+
+    #[test]
+    fn page_up_down_jumps_by_step_and_clamps() {
+        let mut state = state_with_two_workspaces();
+        open_goto(&mut state);
+        let total = state.goto.items.len();
+        assert!(total > 0);
+
+        state.goto.list = 0;
+        handle_goto_key(
+            &mut state,
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::empty()),
+        );
+        let expected_down = GOTO_PAGE_STEP.min(total - 1);
+        assert_eq!(state.goto.list, expected_down);
+
+        handle_goto_key(
+            &mut state,
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::empty()),
+        );
+        assert_eq!(state.goto.list, expected_down.saturating_sub(GOTO_PAGE_STEP));
+
+        // PageDown past the end clamps to the last item.
+        state.goto.list = total - 1;
+        handle_goto_key(
+            &mut state,
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::empty()),
+        );
+        assert_eq!(state.goto.list, total - 1);
+
+        // PageUp at the top stays at 0.
+        state.goto.list = 0;
+        handle_goto_key(
+            &mut state,
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::empty()),
+        );
+        assert_eq!(state.goto.list, 0);
+    }
+
+    #[test]
+    fn home_and_end_jump_to_edges() {
+        let mut state = state_with_two_workspaces();
+        open_goto(&mut state);
+        let total = state.goto.items.len();
+        assert!(total > 0);
+
+        handle_goto_key(
+            &mut state,
+            KeyEvent::new(KeyCode::End, KeyModifiers::empty()),
+        );
+        assert_eq!(state.goto.list, total - 1);
+
+        handle_goto_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Home, KeyModifiers::empty()),
+        );
+        assert_eq!(state.goto.list, 0);
     }
 
     #[test]
