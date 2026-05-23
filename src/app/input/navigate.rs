@@ -492,6 +492,7 @@ pub(crate) enum NavigateAction {
     Detach,
     Goto,
     GotoBlocked,
+    GotoAgents,
 }
 
 fn indexed_navigation_action(
@@ -592,6 +593,7 @@ fn action_for_key(
         (&kb.detach, NavigateAction::Detach),
         (&kb.goto, NavigateAction::Goto),
         (&kb.goto_blocked, NavigateAction::GotoBlocked),
+        (&kb.goto_agents, NavigateAction::GotoAgents),
     ] {
         if action_matches(bindings, key, dispatch) {
             return Some(action);
@@ -789,6 +791,11 @@ pub(super) fn execute_navigate_action_in_context(
             state,
             terminal_runtimes,
             crate::app::state::GotoCategory::BlockedAgents,
+        ),
+        NavigateAction::GotoAgents => super::goto::open_goto_with_category(
+            state,
+            terminal_runtimes,
+            crate::app::state::GotoCategory::Agents,
         ),
     }
 

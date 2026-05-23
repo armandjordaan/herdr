@@ -283,6 +283,7 @@ pub struct Keybinds {
     pub toggle_sidebar: ActionKeybinds,
     pub goto: ActionKeybinds,
     pub goto_blocked: ActionKeybinds,
+    pub goto_agents: ActionKeybinds,
     pub custom_commands: Vec<CustomCommandKeybind>,
 }
 
@@ -423,6 +424,7 @@ impl Config {
             toggle_sidebar: action!("keys.toggle_sidebar", &self.keys.toggle_sidebar),
             goto: action!("keys.goto", &self.keys.goto),
             goto_blocked: action!("keys.goto_blocked", &self.keys.goto_blocked),
+            goto_agents: action!("keys.goto_agents", &self.keys.goto_agents),
             custom_commands: Vec::new(),
         };
 

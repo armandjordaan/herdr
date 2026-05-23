@@ -214,6 +214,8 @@ pub struct KeysConfig {
     pub goto: BindingConfig,
     /// Open the goto picker pre-filtered to blocked agents. Default: "prefix+space".
     pub goto_blocked: BindingConfig,
+    /// Open the goto picker pre-filtered to all agents. Default: "prefix+a".
+    pub goto_agents: BindingConfig,
     /// Optional indexed shortcuts expanded over number keys 1-9.
     pub indexed: IndexedKeysConfig,
     /// Prefix-mode custom command bindings.
@@ -378,6 +380,7 @@ impl Default for KeysConfig {
             toggle_sidebar: BindingConfig::one("prefix+b"),
             goto: BindingConfig::one("prefix+g"),
             goto_blocked: BindingConfig::one("prefix+space"),
+            goto_agents: BindingConfig::one("prefix+a"),
             indexed: IndexedKeysConfig::default(),
             command: Vec::new(),
         }
