@@ -21,14 +21,15 @@ impl App {
         };
         let (rows, cols) = self.state.estimate_pane_size();
         let split_cwd = params.cwd.map(std::path::PathBuf::from).or_else(|| {
-            self.state.workspaces.get(ws_idx).and_then(|ws| {
+            let follow_cwd = self.state.workspaces.get(ws_idx).and_then(|ws| {
                 let tab_idx = ws.find_tab_index_for_pane(target_pane_id)?;
                 ws.tabs.get(tab_idx)?.cwd_for_pane(
                     target_pane_id,
                     &self.state.terminals,
                     &self.terminal_runtimes,
                 )
-            })
+            });
+            Some(self.resolve_new_terminal_cwd(follow_cwd))
         });
         let default_shell = self.state.default_shell.clone();
         let scrollback_limit_bytes = self.state.pane_scrollback_limit_bytes;
@@ -178,6 +179,12 @@ impl App {
         };
         self.handle_internal_event(crate::events::AppEvent::HookStateReported {
             pane_id,
+            session_ref: crate::agent_resume::session_ref_from_report(
+                &params.source,
+                &agent_label,
+                params.agent_session_id,
+                params.agent_session_path,
+            ),
             source: params.source,
             agent_label,
             state: detect_state_from_api(params.state),

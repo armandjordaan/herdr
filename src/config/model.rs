@@ -39,11 +39,45 @@ pub struct ToastConfig {
     pub delivery: ToastDelivery,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum NewTerminalCwdConfig {
+    #[default]
+    Follow,
+    Home,
+    Current,
+    Path(String),
+}
+
+impl<'de> Deserialize<'de> for NewTerminalCwdConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        match value.trim() {
+            "" | "follow" => Ok(Self::Follow),
+            "home" => Ok(Self::Home),
+            "current" => Ok(Self::Current),
+            _ => Ok(Self::Path(value)),
+        }
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct TerminalConfig {
     /// Executable used for new interactive panes. Empty means SHELL, then /bin/sh.
     pub default_shell: String,
+    /// CWD policy for new interactive panes, tabs, and workspaces.
+    pub new_cwd: NewTerminalCwdConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct SessionConfig {
+    /// Resume supported AI-agent panes into their native conversation sessions
+    /// when restoring a Herdr session. Default: false.
+    pub resume_agents_on_restore: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -79,6 +113,7 @@ pub struct Config {
     pub onboarding: Option<bool>,
     pub theme: ThemeConfig,
     pub terminal: TerminalConfig,
+    pub session: SessionConfig,
     pub keys: KeysConfig,
     pub ui: UiConfig,
     pub worktrees: WorktreesConfig,
@@ -437,6 +472,49 @@ default_shell = "nu"
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.terminal.default_shell, "nu");
+    }
+
+    #[test]
+    fn terminal_new_cwd_defaults_follow_and_parses() {
+        let default_config = Config::default();
+        assert_eq!(
+            default_config.terminal.new_cwd,
+            NewTerminalCwdConfig::Follow
+        );
+
+        let config: Config = toml::from_str(
+            r#"
+[terminal]
+new_cwd = "home"
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.terminal.new_cwd, NewTerminalCwdConfig::Home);
+
+        let config: Config = toml::from_str(
+            r#"
+[terminal]
+new_cwd = "~/Projects"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.terminal.new_cwd,
+            NewTerminalCwdConfig::Path("~/Projects".into())
+        );
+    }
+
+    #[test]
+    fn resume_agents_on_restore_defaults_off_and_parses() {
+        let default_config = Config::default();
+        assert!(!default_config.session.resume_agents_on_restore);
+
+        let toml = r#"
+[session]
+resume_agents_on_restore = true
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.session.resume_agents_on_restore);
     }
 
     #[test]

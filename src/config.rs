@@ -19,7 +19,7 @@ pub use self::{
     },
     model::{
         validated_sidebar_bounds, AgentPanelScopeConfig, Config, ConfigReloadReport,
-        ConfigReloadStatus, KeysConfig, ToastConfig, ToastDelivery,
+        ConfigReloadStatus, KeysConfig, NewTerminalCwdConfig, ToastConfig, ToastDelivery,
     },
     sound::SoundConfig,
     theme::{parse_color, CustomThemeColors, ThemeConfig},
@@ -34,6 +34,12 @@ pub const DEFAULT_MOUSE_SCROLL_LINES: usize = 3;
 #[cfg(test)]
 pub(crate) fn app_dir_name() -> &'static str {
     io::app_dir_name()
+}
+
+#[cfg(test)]
+pub(crate) fn test_config_env_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
 
 impl Config {

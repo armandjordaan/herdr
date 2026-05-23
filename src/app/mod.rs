@@ -90,6 +90,7 @@ pub struct App {
     pub(crate) full_redraw_pending: bool,
     pub(crate) overlay_panes: HashMap<crate::layout::PaneId, OverlayPaneState>,
     pub(crate) local_terminal_notifications: bool,
+    pub(crate) config_reloaded_from_disk: bool,
 }
 
 pub(crate) enum LoopEvent {
@@ -254,6 +255,7 @@ impl App {
                 80,
                 config.advanced.scrollback_limit_bytes,
                 &config.terminal.default_shell,
+                config.session.resume_agents_on_restore,
                 event_tx.clone(),
                 render_notify.clone(),
                 render_dirty.clone(),
@@ -326,7 +328,8 @@ impl App {
             (18, 36)
         });
 
-        let worktree_directory = crate::worktree::expand_tilde_path(&config.worktrees.directory);
+        let worktree_directory =
+            crate::worktree::expand_tilde_absolute_path(&config.worktrees.directory);
 
         info!(
             pane_scrollback_limit_bytes = config.advanced.scrollback_limit_bytes,
@@ -454,6 +457,7 @@ impl App {
             cjk_ime_cursor_shape: config.experimental.cjk_ime_cursor_shape.to_decscusr(),
             kitty_graphics_enabled: config.experimental.kitty_graphics,
             default_shell: config.terminal.default_shell.clone(),
+            new_terminal_cwd: config.terminal.new_cwd.clone(),
             pane_scrollback_limit_bytes: config.advanced.scrollback_limit_bytes,
             accent: crate::config::parse_color(&config.ui.accent),
             sound: config.ui.sound.clone(),
@@ -535,6 +539,7 @@ impl App {
             full_redraw_pending: false,
             overlay_panes: HashMap::new(),
             local_terminal_notifications: true,
+            config_reloaded_from_disk: false,
         }
     }
 
@@ -880,10 +885,17 @@ impl App {
         self.apply_config_from_disk(true)
     }
 
+    pub(crate) fn take_config_reloaded_from_disk(&mut self) -> bool {
+        let reloaded = self.config_reloaded_from_disk;
+        self.config_reloaded_from_disk = false;
+        reloaded
+    }
+
     pub(crate) fn apply_config_from_disk(
         &mut self,
         notify_success: bool,
     ) -> crate::config::ConfigReloadReport {
+        self.config_reloaded_from_disk = true;
         let previous_toast = self.state.toast.clone();
         let report = match crate::config::load_live_config() {
             Ok(loaded) => self.apply_live_config(
@@ -1005,11 +1017,12 @@ impl App {
 
         if !invalid_section("terminal") {
             self.state.default_shell = config.terminal.default_shell.clone();
+            self.state.new_terminal_cwd = config.terminal.new_cwd.clone();
         }
 
         if !invalid_section("worktrees") {
             self.state.worktree_directory =
-                crate::worktree::expand_tilde_path(&config.worktrees.directory);
+                crate::worktree::expand_tilde_absolute_path(&config.worktrees.directory);
         }
 
         if !invalid_section("theme") {
@@ -1239,7 +1252,7 @@ mod tests {
     use crate::terminal::TerminalRuntime;
     use crate::workspace::Workspace;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::Mutex;
 
     fn raw_key(
         code: KeyCode,
@@ -1272,8 +1285,7 @@ mod tests {
     }
 
     fn config_env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        crate::config::test_config_env_lock()
     }
 
     fn temp_config_path(name: &str) -> std::path::PathBuf {
@@ -1465,7 +1477,7 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(
             &path,
-            "[terminal]\ndefault_shell = \"nu\"\n[keys]\nnew_workspace = \"prefix+g\"\nprefix = \"ctrl+a\"\n[ui]\nagent_panel_scope = \"current\"\n[ui.toast]\ndelivery = \"herdr\"\n",
+            "[terminal]\ndefault_shell = \"nu\"\nnew_cwd = \"home\"\n[keys]\nnew_workspace = \"prefix+g\"\nprefix = \"ctrl+a\"\n[ui]\nagent_panel_scope = \"current\"\n[ui.toast]\ndelivery = \"herdr\"\n",
         )
         .unwrap();
         std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
@@ -1490,6 +1502,10 @@ mod tests {
             state::AgentPanelScope::CurrentWorkspace
         );
         assert_eq!(app.state.default_shell, "nu");
+        assert_eq!(
+            app.state.new_terminal_cwd,
+            crate::config::NewTerminalCwdConfig::Home
+        );
         assert!(app.state.config_diagnostic.is_none());
         let toast = app.state.toast.as_ref().unwrap();
         assert_eq!(toast.kind, crate::app::state::ToastKind::UpdateInstalled);
@@ -1986,10 +2002,24 @@ mod tests {
                 label: Some("logs".into()),
             }),
         };
+        let worktree_list = crate::api::schema::Request {
+            id: "req_4".into(),
+            method: crate::api::schema::Method::WorktreeList(
+                crate::api::schema::WorktreeListParams::default(),
+            ),
+        };
+        let worktree_create = crate::api::schema::Request {
+            id: "req_5".into(),
+            method: crate::api::schema::Method::WorktreeCreate(
+                crate::api::schema::WorktreeCreateParams::default(),
+            ),
+        };
 
         assert!(!crate::api::request_changes_ui(&read_only));
+        assert!(!crate::api::request_changes_ui(&worktree_list));
         assert!(crate::api::request_changes_ui(&mutating));
         assert!(crate::api::request_changes_ui(&pane_rename));
+        assert!(crate::api::request_changes_ui(&worktree_create));
     }
 
     #[test]
@@ -2056,6 +2086,26 @@ mod tests {
 
         assert_eq!(ws_idx, 1);
         assert_eq!(seed_cwd, std::path::PathBuf::from("/tmp/pion"));
+    }
+
+    #[test]
+    fn new_terminal_cwd_follow_uses_source_cwd() {
+        let cwd = creation::resolve_new_terminal_cwd(
+            &crate::config::NewTerminalCwdConfig::Follow,
+            Some(std::path::PathBuf::from("/tmp/herdr-source")),
+        );
+
+        assert_eq!(cwd, std::path::PathBuf::from("/tmp/herdr-source"));
+    }
+
+    #[test]
+    fn new_terminal_cwd_path_uses_configured_path() {
+        let cwd = creation::resolve_new_terminal_cwd(
+            &crate::config::NewTerminalCwdConfig::Path("/tmp/herdr-fixed".into()),
+            Some(std::path::PathBuf::from("/tmp/herdr-source")),
+        );
+
+        assert_eq!(cwd, std::path::PathBuf::from("/tmp/herdr-fixed"));
     }
 
     #[test]

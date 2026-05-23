@@ -12,25 +12,28 @@ use crate::layout::PaneId;
 pub(crate) const HERDR_PANE_ID_ENV_VAR: &str = "HERDR_PANE_ID";
 const PI_EXTENSION_INSTALL_NAME: &str = "herdr-agent-state.ts";
 const PI_EXTENSION_ASSET: &str = include_str!("assets/pi/herdr-agent-state.ts");
-const PI_INTEGRATION_VERSION: u32 = 1;
+const PI_INTEGRATION_VERSION: u32 = 2;
+const OMP_EXTENSION_INSTALL_NAME: &str = "herdr-omp-agent-state.ts";
+const OMP_EXTENSION_ASSET: &str = include_str!("assets/omp/herdr-agent-state.ts");
+const OMP_INTEGRATION_VERSION: u32 = 1;
 const PI_CODING_AGENT_DIR_ENV_VAR: &str = "PI_CODING_AGENT_DIR";
 const CLAUDE_HOOK_INSTALL_NAME: &str = "herdr-agent-state.sh";
 const CLAUDE_HOOK_ASSET: &str = include_str!("assets/claude/herdr-agent-state.sh");
-const CLAUDE_INTEGRATION_VERSION: u32 = 3;
+const CLAUDE_INTEGRATION_VERSION: u32 = 4;
 const CLAUDE_CONFIG_DIR_ENV_VAR: &str = "CLAUDE_CONFIG_DIR";
 const CODEX_HOOK_INSTALL_NAME: &str = "herdr-agent-state.sh";
 const CODEX_HOOK_ASSET: &str = include_str!("assets/codex/herdr-agent-state.sh");
-const CODEX_INTEGRATION_VERSION: u32 = 3;
+const CODEX_INTEGRATION_VERSION: u32 = 4;
 const CODEX_HOME_ENV_VAR: &str = "CODEX_HOME";
 const OPENCODE_PLUGIN_INSTALL_NAME: &str = "herdr-agent-state.js";
 const OPENCODE_PLUGIN_ASSET: &str = include_str!("assets/opencode/herdr-agent-state.js");
-const OPENCODE_INTEGRATION_VERSION: u32 = 1;
+const OPENCODE_INTEGRATION_VERSION: u32 = 2;
 const HERMES_PLUGIN_INSTALL_NAME: &str = "herdr-agent-state";
 const HERMES_PLUGIN_MANIFEST_INSTALL_NAME: &str = "plugin.yaml";
 const HERMES_PLUGIN_INIT_INSTALL_NAME: &str = "__init__.py";
 const HERMES_PLUGIN_MANIFEST_ASSET: &str = include_str!("assets/hermes/plugin.yaml");
 const HERMES_PLUGIN_INIT_ASSET: &str = include_str!("assets/hermes/__init__.py");
-const HERMES_INTEGRATION_VERSION: u32 = 1;
+const HERMES_INTEGRATION_VERSION: u32 = 2;
 const INTEGRATION_VERSION_MARKER: &str = "HERDR_INTEGRATION_VERSION=";
 
 #[derive(Debug)]
@@ -49,6 +52,12 @@ pub(crate) struct CodexInstallPaths {
 #[derive(Debug)]
 pub(crate) struct OpenCodeInstallPaths {
     pub plugin_path: PathBuf,
+}
+
+#[derive(Debug)]
+pub(crate) struct OmpInstallPaths {
+    pub extension_path: PathBuf,
+    pub removed_legacy_pi_extension: bool,
 }
 
 #[derive(Debug)]
@@ -106,6 +115,12 @@ pub(crate) struct PiUninstallResult {
 }
 
 #[derive(Debug)]
+pub(crate) struct OmpUninstallResult {
+    pub extension_path: PathBuf,
+    pub removed_extension: bool,
+}
+
+#[derive(Debug)]
 pub(crate) struct ClaudeUninstallResult {
     pub hook_path: PathBuf,
     pub settings_path: PathBuf,
@@ -148,6 +163,24 @@ pub(crate) fn install_target(
         crate::api::schema::IntegrationTarget::Pi => {
             let path = install_pi()?;
             vec![format!("installed pi integration to {}", path.display())]
+        }
+        crate::api::schema::IntegrationTarget::Omp => {
+            let installed = install_omp()?;
+            let mut messages = Vec::new();
+            if installed.removed_legacy_pi_extension {
+                messages.push(format!(
+                    "removed legacy pi integration from omp extension directory at {}",
+                    installed
+                        .extension_path
+                        .with_file_name(PI_EXTENSION_INSTALL_NAME)
+                        .display()
+                ));
+            }
+            messages.push(format!(
+                "installed omp integration to {}",
+                installed.extension_path.display()
+            ));
+            messages
         }
         crate::api::schema::IntegrationTarget::Claude => {
             let installed = install_claude()?;
@@ -216,6 +249,20 @@ pub(crate) fn uninstall_target(
             } else {
                 vec![format!(
                     "no pi integration extension found at {}",
+                    result.extension_path.display()
+                )]
+            }
+        }
+        crate::api::schema::IntegrationTarget::Omp => {
+            let result = uninstall_omp()?;
+            if result.removed_extension {
+                vec![format!(
+                    "removed omp integration extension at {}",
+                    result.extension_path.display()
+                )]
+            } else {
+                vec![format!(
+                    "no omp integration extension found at {}",
                     result.extension_path.display()
                 )]
             }
@@ -330,6 +377,7 @@ pub(crate) fn integration_target_label(
 ) -> &'static str {
     match target {
         crate::api::schema::IntegrationTarget::Pi => "pi",
+        crate::api::schema::IntegrationTarget::Omp => "omp",
         crate::api::schema::IntegrationTarget::Claude => "claude",
         crate::api::schema::IntegrationTarget::Codex => "codex",
         crate::api::schema::IntegrationTarget::Opencode => "opencode",
@@ -340,6 +388,7 @@ pub(crate) fn integration_target_label(
 fn integration_target_command(target: crate::api::schema::IntegrationTarget) -> &'static str {
     match target {
         crate::api::schema::IntegrationTarget::Pi => "pi",
+        crate::api::schema::IntegrationTarget::Omp => "omp",
         crate::api::schema::IntegrationTarget::Claude => "claude",
         crate::api::schema::IntegrationTarget::Codex => "codex",
         crate::api::schema::IntegrationTarget::Opencode => "opencode",
@@ -417,12 +466,17 @@ fn integration_specs() -> [(
     crate::api::schema::IntegrationTarget,
     io::Result<PathBuf>,
     u32,
-); 5] {
+); 6] {
     [
         (
             crate::api::schema::IntegrationTarget::Pi,
             pi_extension_dir().map(|dir| dir.join(PI_EXTENSION_INSTALL_NAME)),
             PI_INTEGRATION_VERSION,
+        ),
+        (
+            crate::api::schema::IntegrationTarget::Omp,
+            omp_extension_dir().map(|dir| dir.join(OMP_EXTENSION_INSTALL_NAME)),
+            OMP_INTEGRATION_VERSION,
         ),
         (
             crate::api::schema::IntegrationTarget::Claude,
@@ -546,6 +600,39 @@ pub(crate) fn install_pi() -> io::Result<PathBuf> {
     Ok(path)
 }
 
+pub(crate) fn install_omp() -> io::Result<OmpInstallPaths> {
+    let dir = omp_extension_dir()?;
+    if !dir.is_dir() {
+        return Err(io::Error::other(format!(
+            "omp extension directory not found at {}. install omp and create the extensions directory first",
+            dir.display()
+        )));
+    }
+
+    let removed_legacy_pi_extension = remove_legacy_pi_extension_from_omp_dir(&dir)?;
+    let extension_path = dir.join(OMP_EXTENSION_INSTALL_NAME);
+    fs::write(&extension_path, OMP_EXTENSION_ASSET)?;
+    Ok(OmpInstallPaths {
+        extension_path,
+        removed_legacy_pi_extension,
+    })
+}
+
+fn remove_legacy_pi_extension_from_omp_dir(dir: &Path) -> io::Result<bool> {
+    let legacy_path = dir.join(PI_EXTENSION_INSTALL_NAME);
+    if !legacy_path.is_file() {
+        return Ok(false);
+    }
+
+    let content = fs::read_to_string(&legacy_path)?;
+    if content.contains("HERDR_INTEGRATION_ID=pi") {
+        fs::remove_file(legacy_path)?;
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
 pub(crate) fn install_claude() -> io::Result<ClaudeInstallPaths> {
     let dir = claude_dir()?;
     if !dir.is_dir() {
@@ -595,6 +682,13 @@ pub(crate) fn install_claude() -> io::Result<ClaudeInstallPaths> {
         hooks,
         "SubagentStop",
         &format!("bash {quoted_hook_path} working"),
+    )?;
+    ensure_command_hook(
+        hooks,
+        "SessionStart",
+        format!("bash {quoted_hook_path} idle"),
+        10,
+        Some("*"),
     )?;
     ensure_command_hook(
         hooks,
@@ -790,6 +884,16 @@ pub(crate) fn uninstall_pi() -> io::Result<PiUninstallResult> {
     })
 }
 
+pub(crate) fn uninstall_omp() -> io::Result<OmpUninstallResult> {
+    let extension_path = omp_extension_dir()?.join(OMP_EXTENSION_INSTALL_NAME);
+    let removed_extension = remove_file_if_exists(&extension_path)?;
+
+    Ok(OmpUninstallResult {
+        extension_path,
+        removed_extension,
+    })
+}
+
 pub(crate) fn uninstall_claude() -> io::Result<ClaudeUninstallResult> {
     let hook_path = claude_dir()?.join("hooks").join(CLAUDE_HOOK_INSTALL_NAME);
     let settings_path = claude_dir()?.join("settings.json");
@@ -811,6 +915,11 @@ pub(crate) fn uninstall_claude() -> io::Result<ClaudeUninstallResult> {
             "claude settings hooks",
         )? {
             let quoted_hook_path = shell_single_quote(&hook_path.display().to_string());
+            updated_settings |= remove_command_hook(
+                hooks,
+                "SessionStart",
+                &format!("bash {quoted_hook_path} idle"),
+            )?;
             updated_settings |= remove_command_hook(
                 hooks,
                 "UserPromptSubmit",
@@ -1355,6 +1464,13 @@ fn pi_extension_dir() -> io::Result<PathBuf> {
     )
 }
 
+fn omp_extension_dir() -> io::Result<PathBuf> {
+    Ok(
+        config_dir_from_env_or_home(PI_CODING_AGENT_DIR_ENV_VAR, &[".omp", "agent"])?
+            .join("extensions"),
+    )
+}
+
 fn claude_dir() -> io::Result<PathBuf> {
     config_dir_from_env_or_home(CLAUDE_CONFIG_DIR_ENV_VAR, &[".claude"])
 }
@@ -1554,6 +1670,144 @@ mod tests {
     }
 
     #[test]
+    fn install_omp_writes_embedded_asset_to_omp_extensions_dir() {
+        let _lock = integration_env_lock();
+        let base = unique_base();
+        let home = base.join("home");
+        let ext_dir = home.join(".omp/agent/extensions");
+        fs::create_dir_all(&ext_dir).unwrap();
+        std::env::set_var("HOME", &home);
+
+        let installed = install_omp().unwrap();
+        let content = fs::read_to_string(&installed.extension_path).unwrap();
+
+        assert_eq!(
+            installed.extension_path,
+            ext_dir.join(OMP_EXTENSION_INSTALL_NAME)
+        );
+        assert!(!installed.removed_legacy_pi_extension);
+        assert_eq!(content, OMP_EXTENSION_ASSET);
+
+        std::env::remove_var("HOME");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn install_omp_removes_legacy_pi_integration_from_omp_extensions_dir() {
+        let _lock = integration_env_lock();
+        let base = unique_base();
+        let home = base.join("home");
+        let ext_dir = home.join(".omp/agent/extensions");
+        fs::create_dir_all(&ext_dir).unwrap();
+        let legacy_path = ext_dir.join(PI_EXTENSION_INSTALL_NAME);
+        fs::write(&legacy_path, PI_EXTENSION_ASSET).unwrap();
+        std::env::set_var("HOME", &home);
+
+        let installed = install_omp().unwrap();
+
+        assert_eq!(
+            installed.extension_path,
+            ext_dir.join(OMP_EXTENSION_INSTALL_NAME)
+        );
+        assert!(installed.removed_legacy_pi_extension);
+        assert!(!legacy_path.exists());
+
+        std::env::remove_var("HOME");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn install_omp_preserves_non_herdr_file_with_pi_install_name() {
+        let _lock = integration_env_lock();
+        let base = unique_base();
+        let home = base.join("home");
+        let ext_dir = home.join(".omp/agent/extensions");
+        fs::create_dir_all(&ext_dir).unwrap();
+        let user_path = ext_dir.join(PI_EXTENSION_INSTALL_NAME);
+        fs::write(&user_path, "// user extension\n").unwrap();
+        std::env::set_var("HOME", &home);
+
+        let installed = install_omp().unwrap();
+
+        assert_eq!(
+            installed.extension_path,
+            ext_dir.join(OMP_EXTENSION_INSTALL_NAME)
+        );
+        assert!(!installed.removed_legacy_pi_extension);
+        assert_eq!(
+            fs::read_to_string(user_path).unwrap(),
+            "// user extension\n"
+        );
+
+        std::env::remove_var("HOME");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn install_omp_uses_pi_coding_agent_dir_env() {
+        let _lock = integration_env_lock();
+        let base = unique_base();
+        let agent_dir = base.join("custom-omp-agent");
+        let ext_dir = agent_dir.join("extensions");
+        fs::create_dir_all(&ext_dir).unwrap();
+        std::env::set_var(PI_CODING_AGENT_DIR_ENV_VAR, &agent_dir);
+
+        let installed = install_omp().unwrap();
+
+        assert_eq!(
+            installed.extension_path,
+            ext_dir.join(OMP_EXTENSION_INSTALL_NAME)
+        );
+        assert!(!installed.removed_legacy_pi_extension);
+
+        clear_integration_path_env();
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn uninstall_omp_removes_embedded_extension_when_present() {
+        let _lock = integration_env_lock();
+        let base = unique_base();
+        let home = base.join("home");
+        let ext_dir = home.join(".omp/agent/extensions");
+        fs::create_dir_all(&ext_dir).unwrap();
+        fs::write(
+            ext_dir.join(OMP_EXTENSION_INSTALL_NAME),
+            OMP_EXTENSION_ASSET,
+        )
+        .unwrap();
+        std::env::set_var("HOME", &home);
+
+        let result = uninstall_omp().unwrap();
+
+        assert_eq!(
+            result.extension_path,
+            ext_dir.join(OMP_EXTENSION_INSTALL_NAME)
+        );
+        assert!(result.removed_extension);
+        assert!(!result.extension_path.exists());
+
+        std::env::remove_var("HOME");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn install_omp_errors_when_extension_dir_missing() {
+        let _lock = integration_env_lock();
+        let base = unique_base();
+        let home = base.join("home");
+        fs::create_dir_all(&home).unwrap();
+        std::env::set_var("HOME", &home);
+
+        let err = install_omp().unwrap_err().to_string();
+
+        assert!(err.contains("omp extension directory not found"));
+
+        std::env::remove_var("HOME");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn uninstall_pi_removes_embedded_extension_when_present() {
         let _lock = integration_env_lock();
         let base = unique_base();
@@ -1659,6 +1913,11 @@ mod tests {
         );
         assert_eq!(hook_content, CLAUDE_HOOK_ASSET);
         assert!(settings["permissions"]["allow"].is_array());
+        assert_eq!(settings["hooks"]["SessionStart"][0]["matcher"], "*");
+        assert!(settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains(" idle"));
         assert_eq!(settings["hooks"]["UserPromptSubmit"][0]["matcher"], "*");
         assert!(
             settings["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
@@ -1740,6 +1999,10 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
+            1
+        );
+        assert_eq!(
+            settings["hooks"]["SessionStart"].as_array().unwrap().len(),
             1
         );
         assert!(settings["hooks"].get("PostToolUse").is_none());
@@ -1827,7 +2090,7 @@ mod tests {
 
         assert_eq!(claude.path, hook_path);
         assert_eq!(claude.installed_version, Some(1));
-        assert_eq!(claude.expected_version, 3);
+        assert_eq!(claude.expected_version, 4);
         assert_eq!(claude.state, IntegrationStatusKind::Outdated);
 
         std::env::remove_var("HOME");
@@ -1857,7 +2120,7 @@ mod tests {
 
         assert_eq!(claude.path, hook_path);
         assert_eq!(claude.installed_version, Some(2));
-        assert_eq!(claude.expected_version, 3);
+        assert_eq!(claude.expected_version, 4);
         assert_eq!(claude.state, IntegrationStatusKind::Outdated);
 
         std::env::remove_var("HOME");
@@ -1877,7 +2140,8 @@ mod tests {
         fs::write(
             claude_dir.join("settings.json"),
             format!(
-                r#"{{"hooks":{{"UserPromptSubmit":[{{"matcher":"*","hooks":[{{"type":"command","command":"bash '{}' working","timeout":10}},{{"type":"command","command":"echo keep","timeout":10}}]}}],"PermissionRequest":[{{"matcher":"*","hooks":[{{"type":"command","command":"bash '{}' blocked","timeout":10}}]}}],"PostToolUse":[{{"matcher":"*","hooks":[{{"type":"command","command":"bash '{}' working","timeout":10}}]}}],"PostToolUseFailure":[{{"matcher":"*","hooks":[{{"type":"command","command":"bash '{}' working","timeout":10}}]}}],"SubagentStop":[{{"matcher":"*","hooks":[{{"type":"command","command":"bash '{}' working","timeout":10}}]}}],"Stop":[{{"matcher":"*","hooks":[{{"type":"command","command":"bash '{}' idle","timeout":10}}]}}],"SessionEnd":[{{"matcher":"*","hooks":[{{"type":"command","command":"bash '{}' release","timeout":10}}]}}]}}}}"#,
+                r#"{{"hooks":{{"SessionStart":[{{"matcher":"*","hooks":[{{"type":"command","command":"bash '{}' idle","timeout":10}}]}}],"UserPromptSubmit":[{{"matcher":"*","hooks":[{{"type":"command","command":"bash '{}' working","timeout":10}},{{"type":"command","command":"echo keep","timeout":10}}]}}],"PermissionRequest":[{{"matcher":"*","hooks":[{{"type":"command","command":"bash '{}' blocked","timeout":10}}]}}],"PostToolUse":[{{"matcher":"*","hooks":[{{"type":"command","command":"bash '{}' working","timeout":10}}]}}],"PostToolUseFailure":[{{"matcher":"*","hooks":[{{"type":"command","command":"bash '{}' working","timeout":10}}]}}],"SubagentStop":[{{"matcher":"*","hooks":[{{"type":"command","command":"bash '{}' working","timeout":10}}]}}],"Stop":[{{"matcher":"*","hooks":[{{"type":"command","command":"bash '{}' idle","timeout":10}}]}}],"SessionEnd":[{{"matcher":"*","hooks":[{{"type":"command","command":"bash '{}' release","timeout":10}}]}}]}}}}"#,
+                hook_path.display(),
                 hook_path.display(),
                 hook_path.display(),
                 hook_path.display(),
@@ -1910,6 +2174,7 @@ mod tests {
             "echo keep"
         );
         assert!(settings["hooks"].get("PermissionRequest").is_none());
+        assert!(settings["hooks"].get("SessionStart").is_none());
         assert!(settings["hooks"].get("PostToolUse").is_none());
         assert!(settings["hooks"].get("PostToolUseFailure").is_none());
         assert!(settings["hooks"].get("SubagentStop").is_none());
@@ -1959,7 +2224,7 @@ mod tests {
 
         assert_eq!(codex.path, hook_path);
         assert_eq!(codex.installed_version, Some(2));
-        assert_eq!(codex.expected_version, 3);
+        assert_eq!(codex.expected_version, 4);
         assert_eq!(codex.state, IntegrationStatusKind::Outdated);
 
         std::env::remove_var("HOME");
@@ -2347,5 +2612,19 @@ mod tests {
 
         std::env::remove_var("HOME");
         let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn bundled_integration_assets_report_session_refs() {
+        assert!(PI_EXTENSION_ASSET.contains("agent_session_path: currentAgentSessionPath"));
+        assert!(PI_EXTENSION_ASSET.contains("agent_session_id: currentAgentSessionId"));
+        assert!(PI_EXTENSION_ASSET.contains("publishState(true)"));
+        assert!(CLAUDE_HOOK_ASSET.contains("agent_session_id"));
+        assert!(CODEX_HOOK_ASSET.contains("HERDR_HOOK_INPUT_FILE"));
+        assert!(CODEX_HOOK_ASSET.contains("agent_session_id"));
+        assert!(OPENCODE_PLUGIN_ASSET.contains("properties?.sessionID"));
+        assert!(OPENCODE_PLUGIN_ASSET.contains("agent_session_id: sessionID"));
+        assert!(HERMES_PLUGIN_INIT_ASSET.contains("session_id = _session_id(kwargs)"));
+        assert!(HERMES_PLUGIN_INIT_ASSET.contains("agent_session_id"));
     }
 }

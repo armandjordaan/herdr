@@ -18,6 +18,7 @@ const NESTED_HERDR_MESSAGES: [&str; 6] = [
     "recursion detected. base case not found. aborting.",
 ];
 
+mod agent_resume;
 mod api;
 mod app;
 mod cli;
@@ -81,6 +82,11 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Executable used for new interactive panes.
 # Empty means $SHELL, then /bin/sh.
 # default_shell = ""
+
+# CWD policy for new panes, tabs, and workspaces when no explicit --cwd is provided.
+# Use "follow" to inherit the source pane/workspace, "home" for $HOME,
+# "current" for Herdr's process directory, or a fixed path such as "~/Projects".
+# new_cwd = "follow"
 
 [keys]
 # Prefix key to enter prefix mode (default: "ctrl+b")
@@ -206,6 +212,11 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # By default, droid is muted.
 # [ui.sound.agents]
 # droid = "off"
+
+[session]
+# Resume supported AI-agent panes into their native conversation sessions after
+# a Herdr server restart. Requires official integrations that report session refs.
+# resume_agents_on_restore = false
 
 [experimental]
 # Allow launching herdr from inside a herdr-managed pane.
@@ -342,6 +353,7 @@ fn main() -> io::Result<()> {
         println!("       herdr server reload-config");
         println!("       herdr config <subcommand> ...");
         println!("       herdr workspace <subcommand> ...");
+        println!("       herdr worktree <subcommand> ...");
         println!("       herdr tab <subcommand> ...");
         println!("       herdr agent <subcommand> ...");
         println!("       herdr pane <subcommand> ...");
@@ -372,6 +384,10 @@ fn main() -> io::Result<()> {
             (
                 "herdr workspace <subcommand>",
                 "Workspace helpers over the socket API",
+            ),
+            (
+                "herdr worktree <subcommand>",
+                "Git worktree helpers over the socket API",
             ),
             ("herdr tab <subcommand>", "Tab helpers over the socket API"),
             (
@@ -456,6 +472,7 @@ fn main() -> io::Result<()> {
                 "status",
                 "config",
                 "workspace",
+                "worktree",
                 "pane",
                 "wait",
                 "session",
